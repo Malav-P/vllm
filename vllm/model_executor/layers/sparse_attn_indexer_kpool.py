@@ -22,7 +22,7 @@ elif current_platform.is_rocm():
 else:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 
-from vllm.utils.deep_gemm import has_deep_gemm
+from vllm.utils.deep_gemm import has_deep_gemm, is_deep_gemm_supported
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -535,11 +535,24 @@ def sparse_attn_indexer_kpool(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
-            else:
+            elif is_deep_gemm_supported():
                 from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
+            else:
+                from vllm.v1.attention.ops.mqa_logits_triton import (
+                    fp8_mqa_logits_triton,
+                )
+
+                logits = fp8_mqa_logits_triton(
+                    q_slice_cast,
                     (k_quant_cast, k_scale_cast),
                     weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
@@ -798,7 +811,7 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
             )
-        else:
+        elif is_deep_gemm_supported():
             from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 
             logits = fp8_fp4_paged_mqa_logits(
@@ -809,6 +822,26 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
+                clean_logits=False,
+            )
+        else:
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                fp8_paged_mqa_logits_triton,
+            )
+
+            active_max_model_len = attn_metadata_narrowed.max_seq_len
+            # Triton fallback expects [NB, BS, 1, HD+4]; squeeze the H=1
+            # heads dim that the 4D BNHC allocator inserts.
+            kv_cache_4d = kv_cache
+            if kv_cache_4d.ndim == 5:
+                kv_cache_4d = kv_cache_4d.squeeze(1)
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache_4d,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=active_max_model_len,
                 clean_logits=False,
             )
         num_rows = logits.shape[0]
