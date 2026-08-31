@@ -521,20 +521,6 @@ def compute_kpool_tail_slot_mapping(
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
     out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
-    # DEBUG: validate tail slot mapping
-    import sys as _sys, os as _os
-    _max_val = out[:num_actual_tokens].max().item()
-    _min_val = out[:num_actual_tokens].min().item()
-    _blk_val = own_block[0].item() if own_block.numel() > 0 else -999
-    _pos_val = pos[0].item() if pos.numel() > 0 else -999
-    if _max_val > 100000 or _min_val < -1:
-        print(f"DEBUG TAIL BUILD [{_os.getpid()}]: CORRUPT tail_slot! "
-              f"range=[{_min_val},{_max_val}] own_block={_blk_val} pos={_pos_val} "
-              f"kpool={kpool} bt_shape={list(block_table.shape)} "
-              f"bt_ptr=0x{block_table.data_ptr():x} "
-              f"bt[:1,0]={block_table[:1,0].tolist()} "
-              f"num_reqs={num_reqs} num_tokens={num_actual_tokens}",
-              file=_sys.stderr, flush=True)
     return out
 
 
@@ -571,17 +557,6 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_reqs = common_attn_metadata.num_reqs
             bt = common_attn_metadata.block_table_tensor
             self._cached_own_blocks = bt[:num_reqs, 0].tolist()
-        import sys as _sys, os as _os
-        if not hasattr(self, '_dbg_build_n'):
-            self._dbg_build_n = 0
-        self._dbg_build_n += 1
-        if self._dbg_build_n <= 10:
-            print(f"DEBUG TAIL-BUILD [{_os.getpid()}] #{self._dbg_build_n}: "
-                  f"positions={'tensor'+str(list(positions.shape)) if positions is not None else 'None'} "
-                  f"own_blocks={self._cached_own_blocks} "
-                  f"kpool={kpool} num_dec={num_decode_tokens} "
-                  f"layers={self.layer_names}",
-                  file=_sys.stderr, flush=True)
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,

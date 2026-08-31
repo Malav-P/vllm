@@ -288,9 +288,6 @@ def sparse_attn_indexer_kpool(
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
 ) -> torch.Tensor:
-    # DEBUG: check if a preceding graph segment caused the illegal access
-    import torch as _torch
-    _torch.cuda.synchronize()
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
@@ -714,22 +711,7 @@ def sparse_attn_indexer_kpool(
             if tail_meta is not None:
                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
             if (tail_meta is None or tail_kv_cache is None
-                    or (tail_meta is not None
-                        and getattr(tail_meta, 'tail_own_blocks', None)
-                        is None)):
-                import sys as _sys, os as _os
-                if not hasattr(sparse_attn_indexer_kpool, '_tail_skip_n'):
-                    sparse_attn_indexer_kpool._tail_skip_n = 0
-                sparse_attn_indexer_kpool._tail_skip_n += 1
-                if sparse_attn_indexer_kpool._tail_skip_n <= 5:
-                    print(f"DEBUG TAIL-SKIP [{_os.getpid()}] "
-                          f"#{sparse_attn_indexer_kpool._tail_skip_n}: "
-                          f"tail_meta={'None' if tail_meta is None else type(tail_meta).__name__} "
-                          f"tail_kv_cache={'None' if tail_kv_cache is None else list(tail_kv_cache.shape)} "
-                          f"has_own_blocks={hasattr(tail_meta, 'tail_own_blocks') if tail_meta is not None else 'N/A'} "
-                          f"own_blocks={getattr(tail_meta, 'tail_own_blocks', 'MISSING') if tail_meta is not None else 'N/A'} "
-                          f"tail_prefix={tail_prefix}",
-                          file=_sys.stderr, flush=True)
+                    or tail_meta.tail_own_blocks is None):
                 dec_tail_slot = None
             else:
                 # Recompute the tail slot mapping on-the-fly from Python

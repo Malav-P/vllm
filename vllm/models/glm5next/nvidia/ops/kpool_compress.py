@@ -683,49 +683,6 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     slot_mapping = slot_mapping.contiguous()
     positions = positions.contiguous()
 
-    # DEBUG: compact logging — print once per new position value, always on OOB
-    import sys as _sys
-    import os as _os
-    if not hasattr(kpool_decode_update_and_maybe_write_cache_batched, '_dbg'):
-        kpool_decode_update_and_maybe_write_cache_batched._dbg = {'last_pos': None, 'n': 0}
-    _dbg = kpool_decode_update_and_maybe_write_cache_batched._dbg
-    _dbg['n'] += 1
-    _pos_val = positions.max().item()
-    _slot_max = slot_mapping.max().item()
-    _tail_max = tail_slot_mapping.max().item()
-    _oob = False
-    _max_cache_slot = kv_cache.shape[0] * page_size
-    _valid_slots = slot_mapping[slot_mapping >= 0]
-    if _valid_slots.numel() > 0 and _valid_slots.max().item() >= _max_cache_slot:
-        print(f"DEBUG KPOOL OOB: slot_mapping max={_valid_slots.max().item()} "
-              f"vs capacity={_max_cache_slot}", file=_sys.stderr, flush=True)
-        _oob = True
-    _tail_capacity = tail_kv_cache.shape[0] * pool_size
-    _valid_tail = tail_slot_mapping[tail_slot_mapping >= 0]
-    if _valid_tail.numel() > 0 and _valid_tail.max().item() >= _tail_capacity:
-        print(f"DEBUG KPOOL OOB: tail_slot max={_valid_tail.max().item()} "
-              f"vs capacity={_tail_capacity}", file=_sys.stderr, flush=True)
-        _oob = True
-    if _valid_slots.numel() > 0:
-        _worst_loc = _valid_slots.max().item()
-        _worst_page = _worst_loc // page_size
-        _worst_off = _worst_loc % page_size
-        _worst_k = _worst_page * buf.stride(0) + _worst_off * head_dim + head_dim - 1
-        if _worst_k >= buf.numel():
-            print(f"DEBUG KPOOL OOB: k-write offset={_worst_k} vs buf={buf.numel()} "
-                  f"loc={_worst_loc}", file=_sys.stderr, flush=True)
-            _oob = True
-    # Print on first call, position change, or OOB
-    if _dbg['last_pos'] != _pos_val or _oob or _dbg['n'] <= 2:
-        _pid = _os.getpid()
-        print(f"DEBUG KPOOL [{_pid}] call#{_dbg['n']}: pos={_pos_val} "
-              f"slot_max={_slot_max} tail_max={_tail_max} "
-              f"pos_ptr=0x{positions.data_ptr():x} "
-              f"kv={list(kv_cache.shape)} tail={list(tail_kv_cache.shape)}",
-              file=_sys.stderr, flush=True)
-        _dbg['last_pos'] = _pos_val
-    # END DEBUG
-
     _kpool_decode_update_batched_kernel[(num_requests,)](
         buf_fp8,
         buf_fp32,
