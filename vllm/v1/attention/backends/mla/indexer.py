@@ -571,6 +571,17 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_reqs = common_attn_metadata.num_reqs
             bt = common_attn_metadata.block_table_tensor
             self._cached_own_blocks = bt[:num_reqs, 0].tolist()
+        import sys as _sys, os as _os
+        if not hasattr(self, '_dbg_build_n'):
+            self._dbg_build_n = 0
+        self._dbg_build_n += 1
+        if self._dbg_build_n <= 10:
+            print(f"DEBUG TAIL-BUILD [{_os.getpid()}] #{self._dbg_build_n}: "
+                  f"positions={'tensor'+str(list(positions.shape)) if positions is not None else 'None'} "
+                  f"own_blocks={self._cached_own_blocks} "
+                  f"kpool={kpool} num_dec={num_decode_tokens} "
+                  f"layers={self.layer_names}",
+                  file=_sys.stderr, flush=True)
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
