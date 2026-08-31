@@ -711,7 +711,8 @@ def sparse_attn_indexer_kpool(
             if tail_meta is not None:
                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
             if (tail_meta is None or tail_kv_cache is None
-                    or tail_meta.tail_own_blocks is None):
+                    or tail_meta.tail_own_blocks is None
+                    or torch.cuda.is_current_stream_capturing()):
                 dec_tail_slot = None
             else:
                 # Recompute the tail slot mapping on-the-fly from Python
