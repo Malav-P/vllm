@@ -491,6 +491,13 @@ class DeepseekV32IndexerMetadata:
     num_prefills: int
     num_prefill_tokens: int
 
+    # Per-request first block index for the tail KV cache group, stored as
+    # Python ints so they are immune to GPU memory corruption during CUDA
+    # graph replay.  Used by the kpool eager break to recompute the tail
+    # slot mapping on-the-fly instead of relying on a GPU tensor.
+    tail_own_blocks: list[int] | None = None
+    tail_kpool: int = 0
+
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
@@ -514,6 +521,20 @@ def compute_kpool_tail_slot_mapping(
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
     out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    # DEBUG: validate tail slot mapping
+    import sys as _sys, os as _os
+    _max_val = out[:num_actual_tokens].max().item()
+    _min_val = out[:num_actual_tokens].min().item()
+    _blk_val = own_block[0].item() if own_block.numel() > 0 else -999
+    _pos_val = pos[0].item() if pos.numel() > 0 else -999
+    if _max_val > 100000 or _min_val < -1:
+        print(f"DEBUG TAIL BUILD [{_os.getpid()}]: CORRUPT tail_slot! "
+              f"range=[{_min_val},{_max_val}] own_block={_blk_val} pos={_pos_val} "
+              f"kpool={kpool} bt_shape={list(block_table.shape)} "
+              f"bt_ptr=0x{block_table.data_ptr():x} "
+              f"bt[:1,0]={block_table[:1,0].tolist()} "
+              f"num_reqs={num_reqs} num_tokens={num_actual_tokens}",
+              file=_sys.stderr, flush=True)
     return out
 
 
@@ -532,6 +553,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._cached_own_blocks: list[int] | None = None
 
     def build(
         self,
@@ -544,16 +566,11 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         )
         slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
+        kpool = self.kv_cache_spec.block_size
         if positions is not None:
-            slot_mapping = compute_kpool_tail_slot_mapping(
-                slot_mapping,
-                common_attn_metadata.block_table_tensor,
-                common_attn_metadata.query_start_loc,
-                positions,
-                common_attn_metadata.num_actual_tokens,
-                common_attn_metadata.num_reqs,
-                self.kv_cache_spec.block_size,
-            )
+            num_reqs = common_attn_metadata.num_reqs
+            bt = common_attn_metadata.block_table_tensor
+            self._cached_own_blocks = bt[:num_reqs, 0].tolist()
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
@@ -562,6 +579,8 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
+            tail_own_blocks=self._cached_own_blocks,
+            tail_kpool=kpool,
         )
 
 

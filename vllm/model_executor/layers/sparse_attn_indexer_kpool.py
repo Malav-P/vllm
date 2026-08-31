@@ -288,6 +288,9 @@ def sparse_attn_indexer_kpool(
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
 ) -> torch.Tensor:
+    # DEBUG: check if a preceding graph segment caused the illegal access
+    import torch as _torch
+    _torch.cuda.synchronize()
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
@@ -710,18 +713,41 @@ def sparse_attn_indexer_kpool(
             # tail slot (block * kpool + pos % kpool).
             if tail_meta is not None:
                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
-            if tail_meta is None or tail_kv_cache is None:
+            if (tail_meta is None or tail_kv_cache is None
+                    or tail_meta.tail_own_blocks is None):
                 dec_tail_slot = None
-            elif not use_uniform:
-                dec_tail_slot = _scatter_decode_tokens_by_request(
-                    tail_meta.slot_mapping[:num_decode_tokens],
-                    -1,
-                    num_requests,
-                    lmax,
-                    scatter_idx,
-                )
             else:
-                dec_tail_slot = tail_meta.slot_mapping[:num_decode_tokens].view(shape2)
+                # Recompute the tail slot mapping on-the-fly from Python
+                # ints (immune to GPU memory corruption during CUDA graph
+                # replay) and the positions tensor (correct via weak_ref).
+                _kpool = tail_meta.tail_kpool
+                _own = tail_meta.tail_own_blocks
+                # Cache the tiny GPU tensor on the metadata so the CPU->GPU
+                # transfer happens once per step, not once per kpool layer.
+                _own_t = getattr(tail_meta, '_own_blocks_gpu', None)
+                if _own_t is None or _own_t.shape[0] != num_requests:
+                    _own_t = torch.tensor(
+                        _own, dtype=torch.int64,
+                        device=positions.device)[:num_requests]
+                    tail_meta._own_blocks_gpu = _own_t
+                _pos_i64 = positions[:num_decode_tokens].to(torch.int64)
+                if not use_uniform:
+                    _req_ids = torch.arange(
+                        num_requests, device=positions.device)
+                    _own_exp = _own_t[_req_ids].repeat_interleave(
+                        torch.diff(
+                            attn_metadata_narrowed.decode
+                            .query_start_loc[:num_requests + 1]))
+                    _tail_flat = (
+                        _own_exp[:num_decode_tokens] * _kpool
+                        + _pos_i64 % _kpool)
+                    dec_tail_slot = _scatter_decode_tokens_by_request(
+                        _tail_flat, -1, num_requests, lmax, scatter_idx,
+                    )
+                else:
+                    _own_col = _own_t.unsqueeze(1)  # [B, 1]
+                    _pos_v = _pos_i64.view(shape2)
+                    dec_tail_slot = _own_col * _kpool + _pos_v % _kpool
             # The compress kernel writes the raw fp8 cache (not the quant view);
             # pass the underlying kv_cache, not kv_cache_quant_view.
             if dec_tail_slot is not None:
