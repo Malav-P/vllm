@@ -683,6 +683,20 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     slot_mapping = slot_mapping.contiguous()
     positions = positions.contiguous()
 
+    # Lightweight check: confirm the decode kernel is actually called.
+    import sys as _sys, os as _os
+    if not hasattr(kpool_decode_update_and_maybe_write_cache_batched, '_dbg'):
+        kpool_decode_update_and_maybe_write_cache_batched._dbg = {
+            'last_pos': None, 'n': 0}
+    _dbg = kpool_decode_update_and_maybe_write_cache_batched._dbg
+    _dbg['n'] += 1
+    _pos_val = positions.max().item()
+    if _dbg['last_pos'] != _pos_val or _dbg['n'] <= 2:
+        print(f"DEBUG KPOOL [{_os.getpid()}] call#{_dbg['n']}: "
+              f"pos={_pos_val} nreqs={num_requests}",
+              file=_sys.stderr, flush=True)
+        _dbg['last_pos'] = _pos_val
+
     _kpool_decode_update_batched_kernel[(num_requests,)](
         buf_fp8,
         buf_fp32,
