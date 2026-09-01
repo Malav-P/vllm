@@ -1032,8 +1032,15 @@ class SparseAttnIndexerKpool(CustomOp):
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+            if is_deep_gemm_supported():
+                raise RuntimeError(
+                    "Sparse Attention Indexer CUDA op requires DeepGEMM"
+                    " to be installed.")
+            import warnings
+            warnings.warn(
+                "DeepGEMM not found but not required on this GPU "
+                "(SM80) — kpool will use fallback kernels.",
+                stacklevel=2,
             )
 
     def forward_native(
