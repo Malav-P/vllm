@@ -550,13 +550,27 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(common_attn_metadata)
         )
-        slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
         kpool = self.kv_cache_spec.block_size
         if positions is not None:
             num_reqs = common_attn_metadata.num_reqs
             bt = common_attn_metadata.block_table_tensor
             self._cached_own_blocks = bt[:num_reqs, 0].tolist()
+            # The generic slot_mapping kernel computes
+            #   block_table[req, pos // block_size]
+            # which is out of bounds for the tail cache (1 block per
+            # request, so block_table has only 1 column).  Recompute
+            # the circular slot mapping from the block table directly:
+            #   slot = block_table[req, 0] * kpool + pos % kpool
+            query_start_loc = common_attn_metadata.query_start_loc
+            num_tokens = positions.shape[0]
+            counts = (query_start_loc[1:num_reqs + 1]
+                      - query_start_loc[:num_reqs])
+            block_ids = bt[:num_reqs, 0].repeat_interleave(counts)
+            slot_mapping = (block_ids[:num_tokens] * kpool
+                            + positions[:num_tokens] % kpool)
+        else:
+            slot_mapping = common_attn_metadata.slot_mapping
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,

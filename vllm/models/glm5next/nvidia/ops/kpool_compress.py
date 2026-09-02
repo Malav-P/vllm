@@ -385,6 +385,8 @@ def _kpool_tail_seed_kernel(
     tslot_ptr,
     tail_ptr,
     n_tokens,
+    TAIL_BLOCK_STRIDE,
+    TAIL_HEAD_STRIDE,
     HEAD_DIM: tl.constexpr,
     KPOOL: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -404,18 +406,17 @@ def _kpool_tail_seed_kernel(
     ahead = tl.load(tslot_ptr + i + KPOOL, mask=i + KPOOL < n_tokens, other=-1).to(
         tl.int64
     )
-    # Match the torch semantics exactly: a negative ahead slot floors to a
-    # block id that differs from every real block -> token is in the tail.
-    # Only divide non-negative slots (Triton int div truncates, torch floors).
     if ahead >= 0 and ahead // KPOOL == blk:
         return
     offs = tl.arange(0, BLOCK_D)
     m = offs < HEAD_DIM
-    base = (blk * 2 * KPOOL + t % KPOOL) * HEAD_DIM
+    slot_in_block = t % KPOOL
+    base_k = blk * TAIL_BLOCK_STRIDE + slot_in_block * HEAD_DIM
+    base_s = base_k + TAIL_HEAD_STRIDE
     k = tl.load(key_ptr + i * HEAD_DIM + offs, mask=m)
     s = tl.load(score_ptr + i * HEAD_DIM + offs, mask=m)
-    tl.store(tail_ptr + base + offs, k, mask=m)
-    tl.store(tail_ptr + base + KPOOL * HEAD_DIM + offs, s, mask=m)
+    tl.store(tail_ptr + base_k + offs, k, mask=m)
+    tl.store(tail_ptr + base_s + offs, s, mask=m)
 
 
 def kpool_seed_tail_cache(
@@ -438,6 +439,8 @@ def kpool_seed_tail_cache(
         tslot,
         tail_kv_cache,
         n,
+        tail_kv_cache.stride(0),
+        tail_kv_cache.stride(1),
         HEAD_DIM=head_dim,
         KPOOL=kpool,
         BLOCK_D=triton.next_power_of_2(head_dim),
