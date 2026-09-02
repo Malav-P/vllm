@@ -563,12 +563,12 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             # the circular slot mapping from the block table directly:
             #   slot = block_table[req, 0] * kpool + pos % kpool
             query_start_loc = common_attn_metadata.query_start_loc
-            num_tokens = positions.shape[0]
             counts = (query_start_loc[1:num_reqs + 1]
                       - query_start_loc[:num_reqs])
             block_ids = bt[:num_reqs, 0].repeat_interleave(counts)
-            slot_mapping = (block_ids[:num_tokens] * kpool
-                            + positions[:num_tokens] % kpool)
+            num_actual = block_ids.shape[0]
+            slot_mapping = (block_ids * kpool
+                            + positions[:num_actual] % kpool)
         else:
             slot_mapping = common_attn_metadata.slot_mapping
         return DeepseekV32IndexerMetadata(

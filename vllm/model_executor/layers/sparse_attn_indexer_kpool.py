@@ -293,6 +293,14 @@ def sparse_attn_indexer_kpool(
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
+    # The CUDA cp_gather / indexer_k_quant_and_cache kernels assume a 3-D
+    # kv_cache [num_blocks, block_size, cache_stride] and use kv_cache.size(1)
+    # as cache_block_size.  With LBHNC layout the per-layer slice is 4-D
+    # [num_blocks, num_heads, block_size, head_dim]; num_heads is always 1 for
+    # MLA, so collapsing it makes size(1) == block_size and stride(0) unchanged.
+    if kv_cache.dim() == 4:
+        kv_cache = kv_cache.view(kv_cache.shape[0], -1, kv_cache.shape[-1])
+
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
