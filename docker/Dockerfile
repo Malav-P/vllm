@@ -1,5 +1,22 @@
 # The vLLM Dockerfile is used to construct vLLM image that can be directly used
 # to run the OpenAI compatible server.
+#
+# glm53flash-a100 build command:
+#   podman build \
+#     -f docker/Dockerfile \
+#     --target vllm-openai \
+#     --build-arg torch_cuda_arch_list='8.0' \
+#     --build-arg max_jobs=20 \
+#     --build-arg nvcc_threads=1 \
+#     --build-arg FLASHINFER_VERSION=0.6.18 \
+#     --build-arg FLASHINFER_RELEASE_TAG=v0.6.18 \
+#     -t vllm-glm53flash:latest \
+#     .
+#
+# Notes:
+#   - torch_cuda_arch_list='8.0' targets A100 only
+#   - ninja parallelism = max_jobs // nvcc_threads (20//1 = 20 jobs)
+#   - FLASHINFER args must match a GitHub release tag
 
 # Please update any changes made here to
 # docs/contributing/dockerfile/dockerfile.md and
@@ -947,8 +964,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 
 # Install FlashInfer from release assets.
 # https://docs.flashinfer.ai/installation.html
-ARG FLASHINFER_VERSION=0.6.18rc10
-ARG FLASHINFER_RELEASE_TAG=v0.6.18rc10
+ARG FLASHINFER_VERSION=0.6.18
+ARG FLASHINFER_RELEASE_TAG=v0.6.18
 ARG TARGETARCH
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
@@ -1011,6 +1028,9 @@ ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ARG PYTORCH_CUDA_INDEX_BASE_URL
 ARG PIP_KEYRING_PROVIDER UV_KEYRING_PROVIDER
+ARG FLASHINFER_VERSION=0.6.18
+ARG FLASHINFER_RELEASE_TAG=v0.6.18
+ARG INSTALL_RUBIN_PRERELEASE
 
 # We can specify the standard or nightly build of PyTorch
 ARG PYTORCH_NIGHTLY
