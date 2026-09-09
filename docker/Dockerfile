@@ -794,7 +794,10 @@ ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 ARG PYTORCH_CUDA_INDEX_BASE_URL
 COPY requirements/common.txt /tmp/common.txt
 COPY requirements/cuda.txt /tmp/requirements-cuda.txt
+# FlashInfer is installed separately from release assets below for regular
+# CUDA images.
 RUN --mount=type=cache,target=/opt/uv/cache \
+    sed -i '/^flashinfer-\(python\|cubin\)==/d' /tmp/requirements-cuda.txt && \
     if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' /tmp/requirements-cuda.txt; \
         sed -i 's/^humming-kernels\[cu13\]/humming-kernels[cu12]/' /tmp/requirements-cuda.txt; \
@@ -809,24 +812,18 @@ ARG FLASHINFER_VERSION=0.6.18
 ARG FLASHINFER_RELEASE_TAG=v0.6.18
 ARG TARGETARCH
 RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
-        sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' /tmp/requirements-cuda.txt; \
-        sed -i 's/^humming-kernels\[cu13\]/humming-kernels[cu12]/' /tmp/requirements-cuda.txt; \
-    fi; \
-    if [ "$(echo $CUDA_VERSION | cut -d. -f1)" != "12" ]; then \
-        set -eux; \
-        case "${TARGETARCH}" in \
-          amd64) FLASHINFER_WHEEL_ARCH="x86_64" ;; \
-          arm64) FLASHINFER_WHEEL_ARCH="aarch64" ;; \
-          *) echo "Unsupported FlashInfer wheel architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-        esac; \
-        FLASHINFER_CUDA_VERSION="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"; \
-        FLASHINFER_RELEASE_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}"; \
-        uv pip install --system --no-deps \
-            "${FLASHINFER_RELEASE_URL}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl" \
-            "${FLASHINFER_RELEASE_URL}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
-            "${FLASHINFER_RELEASE_URL}/flashinfer_jit_cache-${FLASHINFER_VERSION}%2B${FLASHINFER_CUDA_VERSION}-cp39-abi3-manylinux_2_28_${FLASHINFER_WHEEL_ARCH}.whl"; \
-    fi
+    set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) FLASHINFER_WHEEL_ARCH="x86_64" ;; \
+      arm64) FLASHINFER_WHEEL_ARCH="aarch64" ;; \
+      *) echo "Unsupported FlashInfer wheel architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    FLASHINFER_CUDA_VERSION="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"; \
+    FLASHINFER_RELEASE_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}"; \
+    uv pip install --system --no-deps \
+        "${FLASHINFER_RELEASE_URL}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl" \
+        "${FLASHINFER_RELEASE_URL}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
+        "${FLASHINFER_RELEASE_URL}/flashinfer_jit_cache-${FLASHINFER_VERSION}%2B${FLASHINFER_CUDA_VERSION}-cp39-abi3-manylinux_2_28_${FLASHINFER_WHEEL_ARCH}.whl"
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
@@ -899,6 +896,12 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         && uv pip install --system dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
+
+# The vLLM wheel still pins the stable FlashInfer Python package. Restore the
+# release candidate after installing vLLM so it matches the cubin and JIT cache.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system --no-deps --reinstall \
+        "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl"
 
 RUN --mount=type=cache,target=/opt/uv/cache \
 . /etc/environment && \
