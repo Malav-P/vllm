@@ -16,11 +16,19 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-# SM80 Triton lacks fp8e4nv; cast float32 → fp8e4b15 (same bit layout in the
-# clamped range) → uint8 so that stores into float8_e4m3fn buffers work on A100.
+# SM80 (A100) Triton cannot emit float8_e4m3fn (fp8e4nv) stores; that cvt needs
+# SM89+. We synthesize the correct e4m3fn bytes via fp8e4b15, which shares the
+# 1-4-3 fp8 layout but uses exponent bias 15 vs e4m3fn's bias 7. The 8-bit bias
+# difference means the SAME byte read as e4m3fn is 2**8 = 256x the e4b15 value:
+#     e4m3fn_bits(v) == e4b15_bits(v / 256)
+# so scaling by 1/256 before the e4b15 cast lands byte-exact e4m3fn values (the
+# 8-bit bias shift aligns the normal AND subnormal ranges of the two formats).
+# Callers pre-clamp x to [-448, 448] (e4m3fn max), so v/256 in [-1.75, 1.75]
+# stays in e4b15's normal range: no spurious saturation, and the NaN code
+# (0x7F) is never produced. Do NOT pass unscaled/unclamped values here.
 @triton.jit
 def _to_fp8_u8(x):
-    return x.to(tl.float8e4b15).to(tl.uint8, bitcast=True)
+    return (x * (1.0 / 256.0)).to(tl.float8e4b15).to(tl.uint8, bitcast=True)
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
@@ -107,9 +115,8 @@ def _fwht_quant_kernel(
     scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
     y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
 
-    # SM80 Triton lacks fp8e4nv; cast via fp8e4b15 (identical bit layout in
-    # the clamped [-448,448] range) and bitcast to uint8 for the store.
-    y_u8 = y.to(tl.float8e4b15).to(tl.uint8, bitcast=True)
+    # y is clamped to [-448, 448]; _to_fp8_u8 emits byte-exact e4m3fn (see note).
+    y_u8 = _to_fp8_u8(y)
     tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :],
              y_u8, mask=rmask[:, None])
     tl.store(sout_ptr + rows, scale, mask=rmask)
@@ -685,21 +692,6 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     tail_slot_mapping = tail_slot_mapping.contiguous()
     slot_mapping = slot_mapping.contiguous()
     positions = positions.contiguous()
-
-    # Lightweight check: confirm the decode kernel is actually called.
-    # DISABLED: .item() forces GPU→CPU sync per kpool layer per step (~30% hit).
-    # import sys as _sys, os as _os
-    # if not hasattr(kpool_decode_update_and_maybe_write_cache_batched, '_dbg'):
-    #     kpool_decode_update_and_maybe_write_cache_batched._dbg = {
-    #         'last_pos': None, 'n': 0}
-    # _dbg = kpool_decode_update_and_maybe_write_cache_batched._dbg
-    # _dbg['n'] += 1
-    # _pos_val = positions.max().item()
-    # if _dbg['last_pos'] != _pos_val or _dbg['n'] <= 2:
-    #     print(f"DEBUG KPOOL [{_os.getpid()}] call#{_dbg['n']}: "
-    #           f"pos={_pos_val} nreqs={num_requests}",
-    #           file=_sys.stderr, flush=True)
-    #     _dbg['last_pos'] = _pos_val
 
     _kpool_decode_update_batched_kernel[(num_requests,)](
         buf_fp8,
