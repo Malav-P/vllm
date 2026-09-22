@@ -743,7 +743,16 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         # Pro-format fused qkv_proj arrives as two tensors (weight and
         # weight_scale_inv). Store them per-layer so that they can be
         # sharded together.
-        pending_fp8_qkv_proj: dict[str, dict[str, torch.Tensor]] = {}
+        # Persist the pending dict on the module across load_weights calls: some
+        # loaders (e.g. --load-format=instanttensor) deliver the qkv weight and
+        # weight_scale_inv in two separate passes, so a call-local dict never
+        # pairs the two halves -> the fused write never fires and the qkv param
+        # stays uninitialized (zero weight, inf scale after the fp8-Marlin
+        # exp-bias -> NaN). Entries self-delete on completion, so the dict is
+        # empty again after a full load.
+        pending_fp8_qkv_proj = getattr(self, "_pending_fp8_qkv_proj", None)
+        if pending_fp8_qkv_proj is None:
+            pending_fp8_qkv_proj = self._pending_fp8_qkv_proj = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
