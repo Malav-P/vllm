@@ -2013,6 +2013,11 @@ def _parse_chat_message_content(
     role = message["role"]
     content = message.get("content")
     reasoning = message.get("reasoning")
+    if reasoning is None:
+        # Clients that echo back the deprecated `reasoning_content` field
+        # (DeepSeek/Hermes convention) must not lose their reasoning before
+        # the chat template sees it.
+        reasoning = message.get("reasoning_content")
 
     if content is None:
         content = []
