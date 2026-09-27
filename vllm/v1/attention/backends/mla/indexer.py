@@ -33,6 +33,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
@@ -491,36 +492,38 @@ class DeepseekV32IndexerMetadata:
     num_prefills: int
     num_prefill_tokens: int
 
-    # Per-request first block index for the tail KV cache group, stored as
-    # Python ints so they are immune to GPU memory corruption during CUDA
-    # graph replay.  Used by the kpool eager break to recompute the tail
-    # slot mapping on-the-fly instead of relying on a GPU tensor.
-    tail_own_blocks: list[int] | None = None
-    tail_kpool: int = 0
-
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
 
 def compute_kpool_tail_slot_mapping(
-    slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
     query_start_loc: torch.Tensor,
     positions: torch.Tensor,
-    num_actual_tokens: int,
+    num_tokens: int,
     num_reqs: int,
     kpool: int,
+    out: torch.Tensor,
 ) -> torch.Tensor:
-    """Map every token to its request's one circular tail block."""
-    out = slot_mapping.clone()
-    if num_actual_tokens == 0:
+    """Map every token to its request's one circular tail block.
+
+    Writes ``out[:num_tokens]`` in place and returns that view. Tokens at or
+    beyond ``query_start_loc[num_reqs]`` (CUDA graph padding) get
+    ``PAD_SLOT_ID``. No host sync and no fresh allocation, so with a
+    persistent ``out`` the result is valid inside a captured graph.
+    """
+    out = out[:num_tokens]
+    if num_tokens == 0:
         return out
-    tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
-    req = torch.searchsorted(query_start_loc, tokens, right=True) - 1
+    tokens = torch.arange(num_tokens, device=out.device)
+    req = torch.searchsorted(query_start_loc[: num_reqs + 1], tokens, right=True) - 1
+    valid = (req >= 0) & (req < num_reqs)
     req = req.clamp_(min=0, max=num_reqs - 1)
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
-    pos = positions[:num_actual_tokens].to(torch.int64)
-    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    pos = positions[:num_tokens].to(torch.int64)
+    slots = own_block * kpool + torch.remainder(pos, kpool)
+    slots.masked_fill_(~valid, PAD_SLOT_ID)
+    out.copy_(slots)
     return out
 
 
@@ -539,7 +542,14 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._cached_own_blocks: list[int] | None = None
+        # Persistent so the tail-write kernel captured in a FULL CUDA graph
+        # keeps reading a live buffer on replay.
+        self.slot_mapping_buffer = torch.full(
+            (vllm_config.scheduler_config.max_num_batched_tokens,),
+            PAD_SLOT_ID,
+            dtype=torch.int64,
+            device=device,
+        )
 
     def build(
         self,
@@ -550,27 +560,21 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(common_attn_metadata)
         )
+        slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
-        kpool = self.kv_cache_spec.block_size
         if positions is not None:
-            num_reqs = common_attn_metadata.num_reqs
-            bt = common_attn_metadata.block_table_tensor
-            self._cached_own_blocks = bt[:num_reqs, 0].tolist()
-            # The generic slot_mapping kernel computes
-            #   block_table[req, pos // block_size]
-            # which is out of bounds for the tail cache (1 block per
-            # request, so block_table has only 1 column).  Recompute
-            # the circular slot mapping from the block table directly:
-            #   slot = block_table[req, 0] * kpool + pos % kpool
-            query_start_loc = common_attn_metadata.query_start_loc
-            counts = (query_start_loc[1:num_reqs + 1]
-                      - query_start_loc[:num_reqs])
-            block_ids = bt[:num_reqs, 0].repeat_interleave(counts)
-            num_actual = block_ids.shape[0]
-            slot_mapping = (block_ids * kpool
-                            + positions[:num_actual] % kpool)
-        else:
-            slot_mapping = common_attn_metadata.slot_mapping
+            # The generic slot-mapping kernel indexes
+            # block_table[req, pos // block_size], but the tail cache has one
+            # block per request, so use block_table[req, 0] * kpool + pos % kpool.
+            slot_mapping = compute_kpool_tail_slot_mapping(
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.query_start_loc,
+                positions,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.num_reqs,
+                self.kv_cache_spec.block_size,
+                out=self.slot_mapping_buffer,
+            )
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
@@ -579,8 +583,6 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
-            tail_own_blocks=self._cached_own_blocks,
-            tail_kpool=kpool,
         )
 
 

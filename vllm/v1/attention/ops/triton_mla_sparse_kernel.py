@@ -117,20 +117,18 @@ def _sparse_mla_compute_tile(
             other=-1,
         )
         mask_kv = (indices >= 0) & (indices < seq_kv)
+        # int64: `indices` are flat rows over the whole raw KV tensor (other
+        # layers' pages interleave), so `row * stride_kv_token` in int32 wraps
+        # once the tensor exceeds 2 GiB of elements (~4 GiB bf16 at 512 lanes).
+        kv_rows = indices.to(tl.int64) * stride_kv_token
 
-        offs_k = (
-            indices[None, :] * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_d[:, None]
-        )
+        offs_k = kv_rows[None, :] + cur_kv_head_id * stride_kv_head + offs_d[:, None]
         k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
         qk = tl.dot(q, k.to(q.dtype))
 
         if BLOCK_DPE > 0:
             offs_kpe = (
-                indices[None, :] * stride_kv_token
-                + cur_kv_head_id * stride_kv_head
-                + offs_dpe[:, None]
+                kv_rows[None, :] + cur_kv_head_id * stride_kv_head + offs_dpe[:, None]
             )
             kpe = tl.load(
                 k_buffer + offs_kpe,
@@ -142,11 +140,7 @@ def _sparse_mla_compute_tile(
         qk *= sm_scale
         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
 
-        offs_v = (
-            indices[:, None] * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_dv[None, :]
-        )
+        offs_v = kv_rows[:, None] + cur_kv_head_id * stride_kv_head + offs_dv[None, :]
         v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -187,7 +181,7 @@ def _sparse_mla_kernel_final(
     BLOCK_DPE: tl.constexpr,
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
-    cur_q = tl.program_id(0)
+    cur_q = tl.program_id(0).to(tl.int64)
     cur_head_id = tl.program_id(1)
     cur_kv_head_id = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
 
@@ -267,7 +261,7 @@ def _sparse_mla_kernel_split(
 ):
     """Stage 1 of split-KV: process one slice of the topk axis and write
     its `(out_partial, lse_partial)` into the mid buffer."""
-    cur_q = tl.program_id(0)
+    cur_q = tl.program_id(0).to(tl.int64)
     cur_head_id = tl.program_id(1)
     split_kv_id = tl.program_id(2)
     cur_kv_head_id = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
@@ -356,7 +350,7 @@ def _sparse_mla_merge_kernel(
     recomputes it locally, which is cheap (O(NUM_KV_SPLITS) scalars) and
     avoids inter-CTA synchronization.
     """
-    cur_q = tl.program_id(0)
+    cur_q = tl.program_id(0).to(tl.int64)
     cur_head_id = tl.program_id(1)
     cur_dv_tile = tl.program_id(2)
 

@@ -77,17 +77,19 @@ def legacy_generic_tail_slots(block_table, query_start_loc, positions):
 
 
 def circular_tail_slots(
-    slot_mapping, block_table, query_start_loc, positions, num_actual, num_reqs
+    slot_mapping, block_table, query_start_loc, positions, num_tokens, num_reqs
 ):
-    return compute_kpool_tail_slot_mapping(
-        slot_mapping,
+    """Fill ``slot_mapping`` in place, as the builder does with its buffer."""
+    compute_kpool_tail_slot_mapping(
         block_table,
         query_start_loc,
         positions,
-        num_actual,
+        num_tokens,
         num_reqs,
         KPOOL,
+        out=slot_mapping,
     )
+    return slot_mapping
 
 
 def make_batch(per_req_positions, padded_len=None):
@@ -189,8 +191,36 @@ def test_circular_mapping_preserves_padding_and_empty_batch():
     assert out.shape == slot_mapping.shape
     assert torch.equal(out[num_actual:], torch.full_like(out[num_actual:], -1))
 
-    empty = circular_tail_slots(slot_mapping, bt, qsl, positions[:0], 0, num_reqs)
-    assert torch.equal(empty, slot_mapping)
+    before = slot_mapping.clone()
+    circular_tail_slots(slot_mapping, bt, qsl, positions[:0], 0, num_reqs)
+    assert torch.equal(slot_mapping, before)
+
+
+def test_circular_mapping_pads_full_cudagraph_tokens():
+    """FULL CUDA graph replay: the batch is padded to the graph size with
+    zero-length requests (query_start_loc[num_reqs+1:] == actual num_tokens)
+    and stale positions / a stale buffer. Padded tokens must come out as -1 so
+    the tail-write kernel skips them, and stale sentinels must be overwritten
+    for real tokens -- the buffer is reused across steps."""
+    own_blocks = [5, 9, 0, 0]  # two real requests + two zeroed padding rows
+    num_reqs = len(own_blocks)
+    num_actual = 4
+    num_padded = 8
+    positions = torch.zeros(num_padded, dtype=torch.int64)
+    positions[:num_actual] = torch.tensor([8, 9, 12, 13])
+    positions[num_actual:] = 7  # stale from a previous step
+    qsl = torch.tensor([0, 2, 4, 4, 4], dtype=torch.int64)
+    bt = make_tail_block_table(own_blocks)
+    buf = torch.full((16,), 12345, dtype=torch.int64)  # stale buffer contents
+
+    out = circular_tail_slots(buf, bt, qsl, positions, num_padded, num_reqs)
+
+    assert out.shape[0] == num_padded
+    expected = torch.tensor(
+        [5 * KPOOL + 0, 5 * KPOOL + 1, 9 * KPOOL + 0, 9 * KPOOL + 1, -1, -1, -1, -1]
+    )
+    assert torch.equal(out, expected)
+    assert torch.equal(buf[:num_padded], expected)
 
 
 def make_common_metadata(per_req_positions, own_blocks, with_positions=True):
@@ -215,9 +245,10 @@ def make_common_metadata(per_req_positions, own_blocks, with_positions=True):
     )
 
 
-def make_tail_builder(block_size=KPOOL):
+def make_tail_builder(block_size=KPOOL, max_num_tokens=64):
     builder = object.__new__(KpoolTailMetadataBuilder)
     builder.kv_cache_spec = SimpleNamespace(block_size=block_size)
+    builder.slot_mapping_buffer = torch.full((max_num_tokens,), -1, dtype=torch.int64)
     return builder
 
 
@@ -225,9 +256,14 @@ def test_builder_build_uses_circular_mapping():
     per_req = [list(range(10)), list(range(12))]
     own_blocks = [5, 9]
     cam = make_common_metadata(per_req, own_blocks)
-    meta = KpoolTailMetadataBuilder.build(make_tail_builder(), 0, cam)
+    builder = make_tail_builder()
+    meta = KpoolTailMetadataBuilder.build(builder, 0, cam)
 
     out = meta.slot_mapping
+    # The returned mapping is a view of the builder's persistent buffer, so a
+    # captured CUDA graph keeps reading live values on replay.
+    assert out.data_ptr() == builder.slot_mapping_buffer.data_ptr()
+    assert out.shape[0] == cam.num_actual_tokens
     off = 0
     for req, prompt in enumerate(per_req):
         for pos in range(len(prompt)):
@@ -235,10 +271,9 @@ def test_builder_build_uses_circular_mapping():
             assert slot // KPOOL == own_blocks[req]
             assert slot % KPOOL == pos % KPOOL
         off += len(prompt)
-    # Padding tail of the buffer keeps the -1 sentinel.
-    assert torch.equal(
-        out[cam.num_actual_tokens :], torch.full_like(out[cam.num_actual_tokens :], -1)
-    )
+    # Beyond the tokens handed to build(), the buffer keeps the -1 sentinel.
+    rest = builder.slot_mapping_buffer[cam.num_actual_tokens :]
+    assert torch.equal(rest, torch.full_like(rest, -1))
 
 
 def test_builder_build_falls_back_without_positions():
