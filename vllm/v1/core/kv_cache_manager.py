@@ -738,6 +738,12 @@ class KVCacheManager:
             self.kv_cache_config.kv_cache_groups,
             self.get_blocks(request.request_id).blocks,
         ):
+            if not group.kv_cache_spec.participates_in_prefix_caching:
+                # Groups that opt out of prefix caching (cross-attention,
+                # encoder-only, GLM-5.3-Flash kpool tail scratch buffers) have
+                # no block hashes; counting them drags the cross-group min to 0
+                # and zeroes the cache-creation estimate.
+                continue
             if isinstance(
                 group.kv_cache_spec,
                 (CrossAttentionSpec, EncoderOnlyAttentionSpec),
