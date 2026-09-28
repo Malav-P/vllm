@@ -170,3 +170,35 @@ def test_prefix_cache_hits_count_toward_start():
         )
         == 492
     )
+
+
+def test_external_tokens_clamped_to_pool_boundary():
+    # A KV connector may report an external hit that is not a multiple of the
+    # pool size. If adopted as-is, the pool straddling the resume boundary can
+    # never be written (its pre-boundary tokens' raw K is not in any batch),
+    # so the slot scores ~0 forever and hides its tokens from the indexer.
+    # The scheduler must round the external prefix down to the boundary.
+    stub = SimpleNamespace(prefill_chunk_alignment=KPOOL)
+    align = Scheduler._align_external_computed_tokens
+    assert align(stub, 4100) == 4096  # 4100 % 16 = 4 -> drop the tail
+    assert align(stub, 4096) == 4096  # already aligned: unchanged
+    assert align(stub, 8) == 0  # smaller than one pool: adopt nothing
+    assert align(stub, 0) == 0
+
+
+def test_external_tokens_untouched_without_kpool():
+    # alignment == 1 (no kpool tail cache): external hits pass through.
+    stub = SimpleNamespace(prefill_chunk_alignment=1)
+    align = Scheduler._align_external_computed_tokens
+    assert align(stub, 4100) == 4100
+    assert align(stub, 0) == 0
+
+
+def test_clamped_external_keeps_chunk_start_aligned():
+    # End-to-end through _pool_aligned_split: external 4100 clamps to 4096,
+    # then the first chunk starts on a pool boundary and its END cut lands on
+    # the next boundary (4096 + 500 = 4596 -> 4592).
+    stub = SimpleNamespace(prefill_chunk_alignment=KPOOL)
+    request = _request(10000)
+    ext = Scheduler._align_external_computed_tokens(stub, 4100)
+    assert Scheduler._pool_aligned_split(stub, request, 500, 0, ext) == 496

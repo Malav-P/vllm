@@ -501,6 +501,23 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
         return max(end // alignment * alignment - start, 0)
 
+    def _align_external_computed_tokens(self, ext_tokens: int) -> int:
+        """Round an external (connector) computed prefix down to a
+        `prefill_chunk_alignment` boundary.
+
+        A compressed indexer cache pool straddling the resume boundary can
+        never be written: `_kpool_compress_insert` pools `alignment`
+        consecutive tokens gathered only from the current batch, and the
+        pre-boundary tokens' raw K is not in any batch (and not recoverable
+        from the compressed cache). The straddling slot would stay unwritten
+        and score ~0 forever, silently hiding its tokens from the indexer.
+        Rounding down makes the first local chunk start on a pool boundary;
+        the trimmed tokens (fewer than `alignment`) are recomputed locally.
+        """
+        if self.prefill_chunk_alignment > 1 and ext_tokens > 0:
+            return ext_tokens - ext_tokens % self.prefill_chunk_alignment
+        return ext_tokens
+
     def _get_local_prefix_cache_hit(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -907,6 +924,16 @@ class Scheduler(SchedulerInterface):
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
+
+                        # A compressed indexer cache pool must not straddle
+                        # the resume boundary (see
+                        # _align_external_computed_tokens): drop the tail so
+                        # the first chunk starts on a pool boundary.
+                        ext_tokens = self._align_external_computed_tokens(ext_tokens)
+                        if ext_tokens == 0:
+                            # Nothing external is adopted; no load can be
+                            # started for a zero-token prefix.
+                            load_kv_async = False
 
                         if partial_tail and ext_tokens > partial_tail:
                             # Remote strictly exceeds the full local hit: drop the
