@@ -10,7 +10,7 @@ from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
-from math import prod
+from math import lcm, prod
 from typing import TYPE_CHECKING, TypeVar
 
 import torch
@@ -1253,6 +1253,26 @@ class KVCacheConfig:
     @property
     def has_mamba_layers(self) -> bool:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
+
+    @property
+    def prefill_chunk_alignment(self) -> int:
+        """Token multiple that intermediate prefill chunks must end on.
+
+        The kpool indexer compresses ``kpool`` consecutive prompt tokens into
+        one cache slot, pooling only tokens of the *current* batch (the tail
+        ring carries a partial pool into decode, not into the next prefill
+        chunk). A chunk that starts mid-pool can never form that pool, so its
+        slot would stay unwritten for the request's lifetime. ``KpoolTailSpec``
+        marks that layout and its ``block_size`` is the pool size. Compressed
+        caches that checkpoint partial state across chunks (DeepSeek-V4) need
+        no alignment and are not counted. 1 means no constraint.
+        """
+        alignment = 1
+        for group in self.kv_cache_groups:
+            for spec in iter_layer_specs(group.kv_cache_spec):
+                if isinstance(spec, KpoolTailSpec):
+                    alignment = lcm(alignment, spec.block_size)
+        return alignment
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:
