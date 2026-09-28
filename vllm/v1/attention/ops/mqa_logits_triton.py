@@ -96,11 +96,15 @@ def _fp8_paged_mqa_logits_kernel(
     batch_id = token_id // next_n
     next_n_id = token_id % next_n
 
-    context_len = tl.load(context_lens_ptr + batch_id)
+    # context_lens is per *token* ([B*next_n], see the wrapper): the number of
+    # KV entries this Q row may attend to, i.e. its causal bound is
+    # `k_offset < context_len`. The indexer builds (B, next_n) rows as
+    # `L - next_n + 1 + j`; indexing by batch_id would read the wrong row
+    # (request 0's rows for batch_id < next_n, then other requests' rows) and
+    # re-subtract the draft length.
+    context_len = tl.load(context_lens_ptr + token_id)
     if block_rk * block_size >= context_len:
         return
-
-    q_offset = context_len - next_n + next_n_id
 
     # int64: unified-KV-pool layer views carry a large block stride (~1e6
     # elements), so int32 `block_idx * stride` wraps once a batch touches
@@ -149,13 +153,15 @@ def _fp8_paged_mqa_logits_kernel(
     out = tl.sum(s, axis=0)
 
     k_offset = block_rk * block_size + offs_n
-    valid = mask_n & (k_offset < context_len) & (k_offset <= q_offset)
+    valid = mask_n & (k_offset < context_len)
     out = tl.where(valid, out, float("-inf"))
 
+    # Downstream topk reads exactly `[:context_len]` of this row, so writing
+    # the same range leaves no uninitialized column for clean_logits=False.
     tl.store(
         logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
         out,
-        mask=mask_n & (k_offset < context_len),
+        mask=valid,
     )
 
 
@@ -174,7 +180,12 @@ def fp8_paged_mqa_logits_triton(
         q:             [B, next_n, H, D] fp8_e4m3fn
         kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
         weights:       [B*next_n, H] float32
-        context_lens:  [B] int32
+        context_lens:  either [B, next_n] int32 per-token KV counts (what the
+            indexer metadata builds for native spec decode: row j of request
+            b attends to `L_b - next_n + 1 + j` entries), or [B] / [B, 1]
+            int32 per-request totals in DeepGEMM's convention (row j then
+            attends to `L_b - next_n + 1 + j`). Both are normalized to the
+            per-token layout the kernel indexes by token id.
         block_tables:  [B, max_blocks] int32
         max_model_len: output width. Caller passes the active batch max so
             the logits buffer and grid stay tight.
@@ -187,6 +198,25 @@ def fp8_paged_mqa_logits_triton(
     _, block_size, one, d_plus_4 = kv_cache.shape
     assert one == 1
     assert d_plus_4 == head_dim + 4
+
+    if context_lens.dim() == 2 and context_lens.shape[1] == next_n:
+        # Already per token; the kernel takes the flat data pointer, so make
+        # sure row-major (B, next_n) is what it sees.
+        context_lens_tok = context_lens.reshape(B * next_n)
+    else:
+        assert context_lens.numel() == B, (
+            f"context_lens {tuple(context_lens.shape)} must be [B, next_n], "
+            f"[B] or [B, 1] for B={B}, next_n={next_n}"
+        )
+        if next_n == 1:
+            context_lens_tok = context_lens.reshape(B)
+        else:
+            # Per-request totals -> per-token causal bounds. Clamp at 0 for
+            # padded (seq_len == 0) rows so an early-exit row stays empty.
+            offs = torch.arange(next_n, device=context_lens.device, dtype=torch.int32)
+            context_lens_tok = (
+                context_lens.reshape(B, 1).to(torch.int32) - next_n + 1 + offs
+            ).clamp_(min=0).reshape(B * next_n)
 
     # Cache layout from `indexer_k_quant_and_cache`: per block, FP8 K bytes
     # (block_size * head_dim) followed by fp32 scales (block_size * 4). The
@@ -226,7 +256,7 @@ def fp8_paged_mqa_logits_triton(
         kv_scale,
         weights,
         fp8_lut,
-        context_lens,
+        context_lens_tok,
         block_tables,
         logits,
         q_byte.stride(0),

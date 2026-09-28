@@ -250,16 +250,23 @@ def test_fp8_mqa_logits_triton_clean_logits_false_overwrites_masked():
         (2, 1, 256),
         (1, 4, 512),  # speculative decoding with next_n=4
         (2, 4, 130),  # active max length is not block-aligned
+        (4, 2, 1000),  # A100 MTP shape: next_n=2, several requests
     ],
 )
 @pytest.mark.parametrize("num_heads", [16, 32])
 @pytest.mark.parametrize("clean_logits", [True, False])
+@pytest.mark.parametrize("ctx_layout", ["per_request", "per_token"])
 def test_fp8_paged_mqa_logits_triton_matches_torch(
-    batch_size, next_n, context_len, num_heads, clean_logits
+    batch_size, next_n, context_len, num_heads, clean_logits, ctx_layout
 ):
     """`clean_logits=True` requires whole-tensor agreement; `clean_logits=False`
     is only correct on `[:, :context_len]` (downstream topk reads only that
-    range), so all comparisons below are sliced accordingly."""
+    range), so all comparisons below are sliced accordingly.
+
+    `ctx_layout="per_token"` feeds the (B, next_n) tensor the indexer metadata
+    actually builds (`L - next_n + 1 + j`); `"per_request"` is DeepGEMM's [B]
+    convention. Requests get distinct lengths so a kernel indexing the flat
+    buffer by request id (instead of token id) is caught."""
     torch.manual_seed(0)
     head_dim = 128
     block_size = 64
@@ -286,9 +293,11 @@ def test_fp8_paged_mqa_logits_triton_matches_torch(
         batch_size * next_n, num_heads, dtype=torch.float32, device=device
     )
 
-    context_lens = torch.full(
-        (batch_size,), context_len, dtype=torch.int32, device=device
+    # Distinct per-request totals (request i is 7*i shorter), all >= next_n.
+    context_lens = context_len - 7 * torch.arange(
+        batch_size, dtype=torch.int32, device=device
     )
+    assert int(context_lens.min()) >= next_n
     block_tables = torch.randint(
         0,
         total_blocks,
@@ -299,6 +308,16 @@ def test_fp8_paged_mqa_logits_triton_matches_torch(
 
     max_model_len = context_len
 
+    if ctx_layout == "per_token":
+        kernel_ctx = (
+            context_lens[:, None]
+            - next_n
+            + 1
+            + torch.arange(next_n, dtype=torch.int32, device=device)
+        ).contiguous()
+    else:
+        kernel_ctx = context_lens
+
     out_torch = _fp8_paged_mqa_logits_ref(
         q_fp8, kv_packed, weights, context_lens, block_tables, max_model_len
     )
@@ -306,20 +325,36 @@ def test_fp8_paged_mqa_logits_triton_matches_torch(
         q_fp8,
         kv_packed,
         weights,
-        context_lens,
+        kernel_ctx,
         block_tables,
         max_model_len,
         clean_logits=clean_logits,
     )
 
-    inf_torch = (torch.isinf(out_torch) & (out_torch < 0))[:, :context_len]
-    inf_triton = (torch.isinf(out_triton) & (out_triton < 0))[:, :context_len]
+    # Contract for clean_logits=False: row (b, j) is defined on
+    # `[:L_b - next_n + 1 + j]`, exactly what downstream topk reads. With
+    # clean_logits=True every position must match.
+    row_bound = (
+        context_lens[:, None]
+        - next_n
+        + 1
+        + torch.arange(next_n, dtype=torch.int32, device=device)
+    ).reshape(-1)
+    cols = torch.arange(max_model_len, device=device)
+    in_range = cols[None, :] < row_bound[:, None]
+    if clean_logits:
+        in_range = torch.ones_like(in_range)
+
+    inf_torch = (torch.isinf(out_torch) & (out_torch < 0)) & in_range
+    inf_triton = (torch.isinf(out_triton) & (out_triton < 0)) & in_range
     assert torch.equal(inf_torch, inf_triton)
-    finite = ~inf_torch
+    # Together with the -inf check above this covers every in-range position,
+    # so an unwritten column (torch.empty garbage) cannot slip through.
+    finite = in_range & ~inf_torch
     if finite.any():
         torch.testing.assert_close(
-            out_triton[:, :context_len][finite],
-            out_torch[:, :context_len][finite],
+            out_triton[finite],
+            out_torch[finite],
             atol=_ATOL,
             rtol=_RTOL,
         )
