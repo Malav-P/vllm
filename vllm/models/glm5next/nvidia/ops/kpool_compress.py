@@ -16,6 +16,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+
 # SM80 (A100) Triton cannot emit float8_e4m3fn (fp8e4nv) stores; that cvt needs
 # SM89+. We synthesize the correct e4m3fn bytes via fp8e4b15, which shares the
 # 1-4-3 fp8 layout but uses exponent bias 15 vs e4m3fn's bias 7. The 8-bit bias
@@ -29,6 +30,7 @@ from vllm.triton_utils import tl, triton
 @triton.jit
 def _to_fp8_u8(x):
     return (x * (1.0 / 256.0)).to(tl.float8e4b15).to(tl.uint8, bitcast=True)
+
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
@@ -117,8 +119,7 @@ def _fwht_quant_kernel(
 
     # y is clamped to [-448, 448]; _to_fp8_u8 emits byte-exact e4m3fn (see note).
     y_u8 = _to_fp8_u8(y)
-    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :],
-             y_u8, mask=rmask[:, None])
+    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y_u8, mask=rmask[:, None])
     tl.store(sout_ptr + rows, scale, mask=rmask)
 
 
@@ -144,7 +145,9 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return q_fp8_buf.view(torch.float8_e4m3fn), q_scale
     BLOCK_R = 32
     grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8_buf, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    _fwht_quant_kernel[grid](
+        q, q_fp8_buf, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2
+    )
     return q_fp8_buf.view(torch.float8_e4m3fn), q_scale
 
 

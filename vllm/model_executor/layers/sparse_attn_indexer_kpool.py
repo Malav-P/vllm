@@ -1019,8 +1019,10 @@ class SparseAttnIndexerKpool(CustomOp):
             if is_deep_gemm_supported():
                 raise RuntimeError(
                     "Sparse Attention Indexer CUDA op requires DeepGEMM"
-                    " to be installed.")
+                    " to be installed."
+                )
             import warnings
+
             warnings.warn(
                 "DeepGEMM not found but not required on this GPU "
                 "(SM80) — kpool will use fallback kernels.",

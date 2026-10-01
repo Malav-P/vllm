@@ -215,8 +215,10 @@ def fp8_paged_mqa_logits_triton(
             # padded (seq_len == 0) rows so an early-exit row stays empty.
             offs = torch.arange(next_n, device=context_lens.device, dtype=torch.int32)
             context_lens_tok = (
-                context_lens.reshape(B, 1).to(torch.int32) - next_n + 1 + offs
-            ).clamp_(min=0).reshape(B * next_n)
+                (context_lens.reshape(B, 1).to(torch.int32) - next_n + 1 + offs)
+                .clamp_(min=0)
+                .reshape(B * next_n)
+            )
 
     # Cache layout from `indexer_k_quant_and_cache`: per block, FP8 K bytes
     # (block_size * head_dim) followed by fp32 scales (block_size * 4). The

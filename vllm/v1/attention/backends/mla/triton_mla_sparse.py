@@ -25,7 +25,6 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_paged_mqa_logits_triton,
 )
 from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
-    _DIM_QK,
     KV_SPLITS_CANDIDATES,
     triton_mla_sparse_attention,
 )

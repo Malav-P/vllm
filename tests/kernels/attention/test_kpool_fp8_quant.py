@@ -39,9 +39,7 @@ def _triton_encode(x_f32: torch.Tensor) -> torch.Tensor:
     n = x_f32.numel()
     out = torch.empty(n, dtype=torch.uint8, device=x_f32.device)
     block = 256
-    _cast_to_e4m3_bytes_kernel[(triton.cdiv(n, block),)](
-        x_f32, out, n, BLOCK=block
-    )
+    _cast_to_e4m3_bytes_kernel[(triton.cdiv(n, block),)](x_f32, out, n, BLOCK=block)
     return out
 
 
@@ -49,9 +47,9 @@ def _e4m3_step(v: torch.Tensor) -> torch.Tensor:
     """Grid spacing of float8_e4m3fn at magnitude ``v`` (normals + subnormals)."""
     absv = v.abs()
     # Smallest normal is 2**-6; below that the grid is uniform at 2**-9.
-    exp = torch.floor(torch.log2(absv.clamp_min(2.0 ** -6)))
+    exp = torch.floor(torch.log2(absv.clamp_min(2.0**-6)))
     step = torch.exp2(exp - 3.0)
-    return torch.maximum(step, torch.full_like(step, 2.0 ** -9))
+    return torch.maximum(step, torch.full_like(step, 2.0**-9))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -68,16 +66,33 @@ def test_to_fp8_u8_within_one_ulp_of_e4m3fn():
     must fail this test.
     """
     torch.manual_seed(0)
-    vals = torch.cat(
-        [
-            torch.linspace(-448.0, 448.0, 8193),
-            torch.tensor(
-                [0.0, -0.0, 448.0, -448.0, 447.5, 1.0, 256.0, 1e-3, -1e-3,
-                 2.0 ** -9, -(2.0 ** -9), 2.0 ** -6, 0.015625],
-            ),
-            (torch.rand(16384) * 2.0 - 1.0) * 448.0,
-        ]
-    ).float().cuda()
+    vals = (
+        torch.cat(
+            [
+                torch.linspace(-448.0, 448.0, 8193),
+                torch.tensor(
+                    [
+                        0.0,
+                        -0.0,
+                        448.0,
+                        -448.0,
+                        447.5,
+                        1.0,
+                        256.0,
+                        1e-3,
+                        -1e-3,
+                        2.0**-9,
+                        -(2.0**-9),
+                        2.0**-6,
+                        0.015625,
+                    ],
+                ),
+                (torch.rand(16384) * 2.0 - 1.0) * 448.0,
+            ]
+        )
+        .float()
+        .cuda()
+    )
 
     got = _triton_encode(vals).view(torch.float8_e4m3fn).float()
     ref = vals.to(torch.float8_e4m3fn).float()
@@ -90,8 +105,15 @@ def test_to_fp8_u8_within_one_ulp_of_e4m3fn():
     n_too_far = int(too_far.sum().item())
     if n_too_far:
         idx = too_far.nonzero()[:8].flatten().tolist()
-        detail = [(round(vals[i].item(), 5), got[i].item(), ref[i].item(),
-                   round(step[i].item(), 6)) for i in idx]
+        detail = [
+            (
+                round(vals[i].item(), 5),
+                got[i].item(),
+                ref[i].item(),
+                round(step[i].item(), 6),
+            )
+            for i in idx
+        ]
         pytest.fail(
             f"{n_too_far}/{vals.numel()} values differ from torch e4m3fn by "
             f">1 ULP. First (input, got, ref, step): {detail}"
@@ -148,7 +170,7 @@ def test_fwht128_quant_roundtrip_preserves_norm():
 
     q_norm = q.float().norm(dim=1)
     deq_norm = deq.norm(dim=1)
-    rel = ((deq_norm - q_norm).abs() / q_norm.clamp_min(1e-6))
+    rel = (deq_norm - q_norm).abs() / q_norm.clamp_min(1e-6)
 
     # e4m3fn ~3-bit mantissa => a few % per-element; norm error stays small.
     assert rel.median().item() < 0.02, f"median rel norm err {rel.median():.4f}"
