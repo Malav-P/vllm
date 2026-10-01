@@ -326,6 +326,10 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        # Compressed attention caches (kpool indexer) pool fixed runs of prompt
+        # tokens from the current batch; intermediate prefill chunks must end
+        # on that multiple. 1 disables the split.
+        self.prefill_chunk_alignment = kv_cache_config.prefill_chunk_alignment
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
             # TODO: support spec decoding
@@ -464,6 +468,56 @@ class Scheduler(SchedulerInterface):
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
+
+    def _pool_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        """Clip a prefill chunk so it ends on a `prefill_chunk_alignment`
+        boundary.
+
+        A compressed indexer cache slot is written when the last token of a
+        pool is computed, pooling the previous `alignment - 1` tokens *of the
+        same batch* (`_kpool_compress_insert`). A chunk that starts mid-pool
+        cannot form that pool, so its slot would stay unwritten and every
+        later query would score stale memory for it. Exempt: the prompt's last
+        chunk, whose trailing partial pool is seeded into the tail ring and
+        completed by decode. Applied last so no later cap can un-align the end;
+        a chunk whose budget cannot reach the next boundary waits a step.
+        """
+        alignment = self.prefill_chunk_alignment
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        # Same prefill extent as the Mamba split: resumed requests replay
+        # their output tokens as prefill.
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        end = start + num_new_tokens
+        if end >= prefill_end:
+            return num_new_tokens
+        return max(end // alignment * alignment - start, 0)
+
+    def _align_external_computed_tokens(self, ext_tokens: int) -> int:
+        """Round an external (connector) computed prefix down to a
+        `prefill_chunk_alignment` boundary.
+
+        A compressed indexer cache pool straddling the resume boundary can
+        never be written: `_kpool_compress_insert` pools `alignment`
+        consecutive tokens gathered only from the current batch, and the
+        pre-boundary tokens' raw K is not in any batch (and not recoverable
+        from the compressed cache). The straddling slot would stay unwritten
+        and score ~0 forever, silently hiding its tokens from the indexer.
+        Rounding down makes the first local chunk start on a pool boundary;
+        the trimmed tokens (fewer than `alignment`) are recomputed locally.
+        """
+        if self.prefill_chunk_alignment > 1 and ext_tokens > 0:
+            return ext_tokens - ext_tokens % self.prefill_chunk_alignment
+        return ext_tokens
 
     def _get_local_prefix_cache_hit(
         self, request: Request
@@ -632,6 +686,11 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
 
+            # Compressed indexer cache: end intermediate chunks on a pool
+            # boundary (last, so nothing above can un-align it).
+            if self.prefill_chunk_alignment > 1:
+                num_new_tokens = self._pool_aligned_split(request, num_new_tokens)
+
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
@@ -646,6 +705,8 @@ class Scheduler(SchedulerInterface):
                 #    models with mamba cache mode \"align\".
                 # 5. Insufficient budget to keep a multi-module MTP prefill
                 #    chunk out of the prefill-lookahead window.
+                # 6. Insufficient budget to reach the next compressed-cache
+                #    pool boundary.
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
@@ -867,6 +928,16 @@ class Scheduler(SchedulerInterface):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
+                        # A compressed indexer cache pool must not straddle
+                        # the resume boundary (see
+                        # _align_external_computed_tokens): drop the tail so
+                        # the first chunk starts on a pool boundary.
+                        ext_tokens = self._align_external_computed_tokens(ext_tokens)
+                        if ext_tokens == 0:
+                            # Nothing external is adopted; no load can be
+                            # started for a zero-token prefix.
+                            load_kv_async = False
+
                         if partial_tail and ext_tokens > partial_tail:
                             # Remote strictly exceeds the full local hit: drop the
                             # sub-block tail so no CoW is needed, and let the load
@@ -1041,6 +1112,16 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
+
+                    # Compressed indexer cache: end intermediate chunks on a
+                    # pool boundary (last, so nothing above can un-align it).
+                    if self.prefill_chunk_alignment > 1:
+                        num_new_tokens = self._pool_aligned_split(
+                            request,
+                            num_new_tokens,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
@@ -2909,17 +2990,39 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
+            req = self.requests.get(req_id)
+            if req is None:
+                # The request was already removed (e.g. aborted after a
+                # failed/late KV transfer). Drop the stale completion instead
+                # of crashing the engine.
+                logger.warning(
+                    "Finished recving KV transfer for request %s, but it is "
+                    "no longer tracked (likely aborted). Ignoring.",
+                    req_id,
+                )
+                continue
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+            elif RequestStatus.is_finished(req.status):
+                self._free_blocks(req)
             else:
-                assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                logger.warning(
+                    "Finished recving KV transfer for request %s in "
+                    "unexpected status %s; ignoring.",
+                    req_id,
+                    req.status,
+                )
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "Finished sending KV transfer for request %s, but it is "
+                    "no longer tracked (likely aborted). Ignoring.",
+                    req_id,
+                )
+                continue
+            self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,

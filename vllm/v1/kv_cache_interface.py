@@ -10,7 +10,7 @@ from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
-from math import prod
+from math import lcm, prod
 from typing import TYPE_CHECKING, TypeVar
 
 import torch
@@ -151,7 +151,8 @@ class KVCacheSpec:
     block_size: int
 
     @property
-    def prefix_cacheable(self) -> bool:
+    def participates_in_prefix_caching(self) -> bool:
+        """Whether this spec's group participates in prefix caching."""
         return True
 
     @property
@@ -549,6 +550,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
+    storage_block_size: int | None = None
+    """Token width used to view storage when it differs from the kernel block."""
     # Marks draft groups that flatten a non-causal query block into decode rows.
     non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
@@ -566,18 +569,16 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        storage_block_size_set = set(spec.storage_block_size for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
+            and len(storage_block_size_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, tokens per state, and model version."
-        )
-        non_causal_mtd_set = {spec.non_causal_multi_token_decode for spec in specs}
-        assert len(non_causal_mtd_set) == 1, (
-            "All attention layers in the same KV cache group must agree on "
-            "non_causal_multi_token_decode."
+            "quantization method, tokens per state, model version, and storage "
+            "block size."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -591,7 +592,10 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
-            non_causal_multi_token_decode=non_causal_mtd_set.pop(),
+            storage_block_size=storage_block_size_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -777,7 +781,7 @@ class CircularBufferSpec(AttentionSpec):
         )
 
     @property
-    def prefix_cacheable(self) -> bool:
+    def participates_in_prefix_caching(self) -> bool:
         return False
 
 
@@ -847,6 +851,28 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class KpoolTailSpec(SlidingWindowSpec):
+    """One-block circular scratch cache for a kpool indexer's raw tail."""
+
+    def max_admission_blocks_per_request(
+        self, max_in_flight_tokens: int, max_model_len: int
+    ) -> int:
+        return 1
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(isinstance(spec, KpoolTailSpec) for spec in kv_cache_specs.values())
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return False
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
@@ -868,6 +894,10 @@ class MambaSpec(KVCacheSpec):
             prod(shape) * get_dtype_size(dtype)
             for (shape, dtype) in zip(self.shapes, self.dtypes)
         )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.state_content_size_bytes
 
     @property
     def page_size_bytes(self) -> int:
@@ -1005,8 +1035,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
-    def prefix_cacheable(self) -> bool:
-        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+    def participates_in_prefix_caching(self) -> bool:
+        return all(
+            spec.participates_in_prefix_caching for spec in self.kv_cache_specs.values()
+        )
 
     @property
     def first_spec(self) -> KVCacheSpec:
@@ -1268,6 +1300,26 @@ class KVCacheConfig:
             for group in self.kv_cache_groups
             for spec in iter_layer_specs(group.kv_cache_spec)
         )
+
+    @property
+    def prefill_chunk_alignment(self) -> int:
+        """Token multiple that intermediate prefill chunks must end on.
+
+        The kpool indexer compresses ``kpool`` consecutive prompt tokens into
+        one cache slot, pooling only tokens of the *current* batch (the tail
+        ring carries a partial pool into decode, not into the next prefill
+        chunk). A chunk that starts mid-pool can never form that pool, so its
+        slot would stay unwritten for the request's lifetime. ``KpoolTailSpec``
+        marks that layout and its ``block_size`` is the pool size. Compressed
+        caches that checkpoint partial state across chunks (DeepSeek-V4) need
+        no alignment and are not counted. 1 means no constraint.
+        """
+        alignment = 1
+        for group in self.kv_cache_groups:
+            for spec in iter_layer_specs(group.kv_cache_spec):
+                if isinstance(spec, KpoolTailSpec):
+                    alignment = lcm(alignment, spec.block_size)
+        return alignment
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:

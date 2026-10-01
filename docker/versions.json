@@ -73,6 +73,9 @@
     "FLASHINFER_VERSION": {
       "default": "0.6.18"
     },
+    "FLASHINFER_RELEASE_TAG": {
+      "default": "v0.6.18"
+    },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"
     },

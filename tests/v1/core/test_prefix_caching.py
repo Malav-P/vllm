@@ -43,6 +43,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpecKind,
@@ -4411,3 +4412,69 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def test_estimate_cached_tokens_skips_non_participating_groups():
+    """A group that opts out of prefix caching must not drag the cross-group
+    min() in estimate_cached_tokens to 0.
+
+    The GLM-5.3-Flash kpool tail group is a per-request circular scratch
+    buffer whose blocks are never hashed; counting it zeroed
+    cache_creation_input_tokens on every request even though the attention
+    groups were fully cached.
+    """
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attn"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["sw"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=2 * block_size,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["tail"],
+                KpoolTailSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=block_size,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=1024,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    # 2 full blocks + a partial tail.
+    req = make_request("0", list(range(40)), block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req)
+    assert (
+        manager.allocate_slots(req, 40, num_computed_tokens, computed_blocks)
+        is not None
+    )
+
+    # The attention groups hashed 2 full blocks each; the tail group hashed
+    # nothing. The estimate must come from the participating groups only.
+    assert manager.estimate_cached_tokens(req) == 2 * block_size
+    manager.free(req)

@@ -110,7 +110,10 @@ class DraftModelSpeculator(BaseSpeculator):
         # collapsed hidden states, so the drafter's buffers must match. Key off
         # that hook rather than hc_mult alone -- HY V4 runs iHC in its backbone
         # (hc_mult=4) but its MTP head consumes the collapsed states, so
-        # widening it feeds propose() a 4x-too-wide buffer.
+        # widening it feeds propose() a 4x-too-wide buffer. GLM-5.3-Flash's MTP
+        # draft similarly consumes collapsed hidden states (eh_proj: hidden*2
+        # -> hidden) and doesn't implement the hook, so it is correctly left
+        # unwidened here too.
         if _target_feeds_hc_residual(vllm_config):
             hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
             self.hidden_size = self.hidden_size * hc_mult

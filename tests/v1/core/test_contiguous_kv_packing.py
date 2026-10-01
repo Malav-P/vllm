@@ -215,13 +215,13 @@ class TestCSALinearGrouping:
                 *(_compressed_name(i) for i in range(NUM_CACHE_TUPLES)),
             ]
         )
-        assert owner.kv_cache_spec.prefix_cacheable
+        assert owner.kv_cache_spec.participates_in_prefix_caching
 
         scratch = next(g for g in groups if _compressor_state_name(0) in g.layer_names)
         assert scratch.layer_names == [
             _compressor_state_name(i) for i in range(NUM_CACHE_TUPLES)
         ]
-        assert not scratch.kv_cache_spec.prefix_cacheable
+        assert not scratch.kv_cache_spec.participates_in_prefix_caching
 
     def test_every_group_fits_one_packed_block(self):
         config = _shared_layout_config()
@@ -263,7 +263,7 @@ class TestCSALinearGrouping:
         blocks = manager.create_kv_cache_blocks(
             tuple(
                 manager.block_pool.get_new_blocks(3)
-                if group.kv_cache_spec.prefix_cacheable
+                if group.kv_cache_spec.participates_in_prefix_caching
                 else []
                 for group in scheduler_config.kv_cache_groups
             )
@@ -272,7 +272,7 @@ class TestCSALinearGrouping:
         scratch_index = next(
             i
             for i, group in enumerate(scheduler_config.kv_cache_groups)
-            if not group.kv_cache_spec.prefix_cacheable
+            if not group.kv_cache_spec.participates_in_prefix_caching
         )
         assert truncated.blocks[scratch_index] == []
 

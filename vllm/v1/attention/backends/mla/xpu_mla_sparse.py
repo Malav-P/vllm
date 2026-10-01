@@ -271,7 +271,7 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)
