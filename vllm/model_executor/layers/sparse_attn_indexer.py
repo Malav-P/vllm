@@ -781,6 +781,7 @@ class SparseAttnIndexer(CustomOp):
         max_model_len: int,
         max_total_seq_len: int,
         topk_indices_buffer: torch.Tensor,
+        num_heads: int,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
     ):
@@ -815,6 +816,31 @@ class SparseAttnIndexer(CustomOp):
                 "DeepGEMM not supported on this platform; "
                 "using Triton fallback for sparse attention indexer."
             )
+            # Prime the autotune caches (and, as a side effect of the first
+            # launch, the e4m3 decode LUT) here rather than in a warmup hook:
+            # memory profiling captures cudagraphs before any hook runs, and
+            # the autotuner's synchronizing benchmark is illegal under
+            # capture.
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                warmup_fp8_mqa_logits_triton,
+                warmup_fp8_paged_mqa_logits_triton,
+            )
+
+            if not use_fp4_cache:
+                device = topk_indices_buffer.device
+                warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
+                # 64/256 are the V3.2 and V4 indexer kernel block sizes; the
+                # configured cache block size covers user-chosen values, which
+                # the backends accept as any MultipleOf(64).
+                block_sizes = {
+                    64,
+                    256,
+                    get_current_vllm_config().cache_config.block_size,
+                }
+                for kernel_block_size in sorted(block_sizes):
+                    warmup_fp8_paged_mqa_logits_triton(
+                        num_heads, head_dim, kernel_block_size, device
+                    )
 
     @property
     def cp_kv_cache_interleave_size(self) -> int:
