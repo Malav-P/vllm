@@ -957,6 +957,10 @@ class OffloadingConnectorScheduler:
                 num_chunks = req_status.storable_chunks(
                     group_config, num_offloadable_tokens
                 )
+                num_chunks = min(
+                    num_chunks,
+                    len(group_state.block_ids) // blocks_per_chunk,
+                )
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 if num_chunks <= start_chunk_idx:

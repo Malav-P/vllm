@@ -754,8 +754,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             prefill_max_seq_len = attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]
+            mha_prefill_supported = getattr(
+                self.impl, "mha_prefill_supported", True
+            )
             use_mha = (
-                self.prefill_backend is not None
+                mha_prefill_supported
+                and self.prefill_backend is not None
                 and prefill_max_seq_len <= attn_metadata.topk_tokens  # type: ignore[attr-defined]
                 and not self._vllm_config.attention_config.sparse_mla_force_mqa
             )
