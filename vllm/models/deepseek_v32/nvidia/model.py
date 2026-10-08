@@ -287,16 +287,15 @@ class DeepseekV32Model(torch.nn.Module):
             else:
                 assert input_ids is not None
                 hidden_states = self.embed_input_ids(input_ids)
-            residual = None
         else:
             assert intermediate_tensors is not None
-            # The previous stage sends the full residual stream; the first
-            # layer here treats it like an embedding (plain RMSNorm, no AR).
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = None
             if self.pp_carries_topk:
                 topk_indices = intermediate_tensors["topk_indices"]
                 self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
+        # A later PP stage receives the full residual stream, so its first layer
+        # treats it like an embedding (plain RMSNorm, no AR).
+        residual = None
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
@@ -308,7 +307,6 @@ class DeepseekV32Model(torch.nn.Module):
             hidden_states = sp_shard(hidden_states)
             if attn_in is not None:
                 attn_in = sp_shard(attn_in)
-            assert residual is None, "Currently, SP is not supported with PP"
 
         aux_hidden_states = []
         for idx, layer in enumerate(
