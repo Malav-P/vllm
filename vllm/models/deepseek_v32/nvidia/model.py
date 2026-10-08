@@ -233,7 +233,7 @@ class DeepseekV32Model(torch.nn.Module):
         else:
             self.norm = PPMissingLayer()
         make_empty_hidden = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+            ["hidden_states"], config.hidden_size
         )
         # A stage that starts by reusing top-k needs the previous stage's.
         pp = get_pp_group()
@@ -290,8 +290,10 @@ class DeepseekV32Model(torch.nn.Module):
             residual = None
         else:
             assert intermediate_tensors is not None
+            # The previous stage sends the full residual stream; the first
+            # layer here treats it like an embedding (plain RMSNorm, no AR).
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            residual = None
             if self.pp_carries_topk:
                 topk_indices = intermediate_tensors["topk_indices"]
                 self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
@@ -325,12 +327,9 @@ class DeepseekV32Model(torch.nn.Module):
                 "Currently, SP is not supported with PP"
             )
             # hidden_states is a per-TP-rank partial sum, but PP send/recv
-            # requires TP-replicated tensors. Reduce it into the residual.
-            residual = residual + tensor_model_parallel_all_reduce(hidden_states)
-            tensors = {
-                "hidden_states": torch.zeros_like(residual),
-                "residual": residual,
-            }
+            # requires TP-replicated tensors.
+            hidden_states = residual + tensor_model_parallel_all_reduce(hidden_states)
+            tensors = {"hidden_states": hidden_states}
             if self.pp_carries_topk:
                 tensors["topk_indices"] = self.topk_indices_buffer[:full_num_tokens]
             return IntermediateTensors(tensors)
