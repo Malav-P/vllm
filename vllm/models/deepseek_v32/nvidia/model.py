@@ -172,6 +172,8 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
 
 class DeepseekV32Model(torch.nn.Module):
     fall_back_to_pt_during_load = False
+    # Tensors that forward() sends between PP stages.
+    intermediate_tensor_keys = ["hidden_states"]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
