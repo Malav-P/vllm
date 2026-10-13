@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -85,6 +86,10 @@ class XPUMLASparseMetadata(AttentionMetadata):
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
 
+    num_decode_tokens: int = 0
+    num_decodes: int = 0
+    num_prefills: int = 0
+    prefill_max_seq_len: int = 0
     block_size: int = 1
     topk_tokens: int = 2048
 
@@ -163,6 +168,16 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
 
+        (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
+            split_decodes_and_prefills(common_attn_metadata)
+        )
+
+        prefill_max_seq_len = 0
+        if num_prefills > 0:
+            prefill_max_seq_len = int(
+                common_attn_metadata.seq_lens[num_decodes:].max().item()
+            )
+
         metadata = XPUMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -172,6 +187,10 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
+            num_decode_tokens=num_decode_tokens,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            prefill_max_seq_len=prefill_max_seq_len,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             # Route every token through the sparse MQA path (see the field
@@ -185,6 +204,10 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
 class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
     is_sparse = True
+    # The XPU/Triton sparse kernel only supports the compressed MLA dimension
+    # (dim_qk=576). The MHA prefill path passes per-head queries (dim_qk=256)
+    # which the kernel cannot process. Route all tokens through MQA instead.
+    mha_prefill_supported = False
 
     def __init__(
         self,
