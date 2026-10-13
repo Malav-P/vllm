@@ -1215,6 +1215,7 @@ class KVCacheTensor:
     layer_stride: int
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
+    host_resident: bool = False
 
 
 @dataclass
@@ -1230,6 +1231,8 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # Host groups use the dedicated HiSparse pool; others share the device pool.
+    host_resident: bool = False
     # Whether this group is part of the externally transferable KV state.
     enable_kv_transfer: bool = True
 
@@ -1256,6 +1259,10 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+    hisparse_host_num_blocks: int | None = None
+    """Number of host-resident blocks for HiSparse offload."""
+    hisparse_shared_host_pool: bool = False
+    """Whether host-resident groups share one host pool."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
