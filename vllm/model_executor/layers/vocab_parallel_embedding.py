@@ -328,10 +328,14 @@ class VocabParallelEmbedding(PluggableLayer):
 
         # The fused kernel masks, shifts and gathers in one pass; it assumes a
         # plain row-major shard, so it only applies to unquantized weights.
+        # Guard on op registration too: a precompiled _C extension built before
+        # this kernel was added won't expose it, even though the Python side
+        # supports it.
         self.use_fused_embedding = (
             self.tp_size > 1
             and current_platform.is_cuda()
             and isinstance(quant_method, UnquantizedEmbeddingMethod)
+            and hasattr(torch.ops._C, "vocab_parallel_embedding")
         )
 
         self.quant_method.create_weights(
