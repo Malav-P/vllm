@@ -1238,6 +1238,13 @@ ARG CUDA_VERSION
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
+# Kronos release-train identity (docs: compute tree, docs/internal/
+# vllm-releases.md). Set at build time:
+#   docker build --build-arg KRONOS_RELEASE=allmodels-<date> ...
+# Consumed by compute/tools/vllm_release.sh (config digest -> registry
+# config Env -> KRONOS_RELEASE) and by `singularity exec $SIF
+# env` for on-host SIF checks.
+ARG KRONOS_RELEASE=
 ARG VLLM_IMAGE_TAG
 
 ARG PIP_INDEX_URL UV_INDEX_URL
@@ -1330,6 +1337,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         /tmp/triton-source-wheel.sha256
 
 ENV VLLM_USAGE_SOURCE production-docker-image
+ENV KRONOS_RELEASE=${KRONOS_RELEASE:-unreleased}
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
@@ -1342,6 +1350,9 @@ LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
       ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}"
+# Kronos release identity, same value as ENV KRONOS_RELEASE above
+# (vllm_release.sh reads the ENV; LABEL is for docker/singularity inspect).
+LABEL io.kronos.release="${KRONOS_RELEASE}"
 
 # define sagemaker first, so it is not default from `docker build`
 FROM vllm-openai-base AS vllm-sagemaker
