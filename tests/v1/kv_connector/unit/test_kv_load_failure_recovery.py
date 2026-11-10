@@ -6,6 +6,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    SupportsHMA,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
@@ -33,6 +37,84 @@ def _make_get_num_new_matched_tokens(
 def scheduler():
     vllm_config = create_vllm_config(kv_load_failure_policy="recompute")
     return create_scheduler(vllm_config)
+
+
+class _HMAConnector(KVConnectorBase_V1, SupportsHMA):
+    """Spec for a mock connector that supports multiple KV cache groups."""
+
+
+@pytest.mark.parametrize("multi_group", [False, True])
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+def test_failed_receive_completion_honors_failure_policy(policy, multi_group):
+    """Failed receives still need completion to free blocks or resume computation.
+
+    multi_group=True with policy="fail" is the hybrid-KV case where a
+    block-level report used to crash EngineCore: a request-level failure must
+    finish only the failed request, leaving others to proceed.
+    """
+    vllm_config = create_vllm_config(kv_load_failure_policy=policy)
+    kv_cache_config = (
+        make_kv_cache_config(block_size=16, swa_enabled=True) if multi_group else None
+    )
+    scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
+    if multi_group:
+        assert len(scheduler.kv_cache_config.kv_cache_groups) == 2
+    failed = create_request(num_tokens=3 * scheduler.block_size)
+    loaded = create_request(num_tokens=3 * scheduler.block_size)
+    scheduler.add_request(failed)
+    scheduler.add_request(loaded)
+
+    # Each request gets one async external hit; a recomputing request finds
+    # nothing external the second time around.
+    pending_hits = {failed.request_id, loaded.request_id}
+
+    def get_num_new_matched_tokens(request: Request, _: int) -> tuple[int, bool]:
+        if request.request_id in pending_hits:
+            pending_hits.discard(request.request_id)
+            return 2 * scheduler.block_size, True
+        return 0, False
+
+    scheduler.connector = Mock(spec=_HMAConnector) if multi_group else Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        get_num_new_matched_tokens
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.request_finished_all_groups.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+    block_pool = scheduler.kv_cache_manager.block_pool
+    free_blocks_before = block_pool.get_num_free_blocks()
+    scheduler_output = scheduler.schedule()
+    assert failed.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert loaded.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    output = create_model_runner_output(
+        [],
+        finished_recving={failed.request_id, loaded.request_id},
+        failed_recving={failed.request_id},
+    )
+    scheduler.update_from_output(scheduler_output, output)
+
+    if policy == "fail":
+        assert failed.status == RequestStatus.FINISHED_ERROR
+        assert failed.request_id not in scheduler.requests
+    else:
+        assert failed.num_computed_tokens == 0
+    assert loaded.num_computed_tokens == 2 * scheduler.block_size
+
+    next_output = scheduler.schedule()
+    assert loaded.request_id in next_output.num_scheduled_tokens
+    if policy == "recompute":
+        assert failed.request_id in next_output.num_scheduled_tokens
+        return
+
+    assert failed.request_id not in next_output.num_scheduled_tokens
+    # Finishing a step returns blocks whose free was deferred behind in-flight
+    # GPU writes; then nothing from either request may remain allocated.
+    scheduler.update_from_output(
+        next_output, create_model_runner_output([loaded], use_eos=True)
+    )
+    assert loaded.is_finished()
+    assert block_pool.get_num_free_blocks() == free_blocks_before
 
 
 @pytest.mark.parametrize(
