@@ -16,11 +16,13 @@ class DummyModelRunnerOutput(ModelRunnerOutput):
         finished_recving: set[str] | None = None,
         invalid_block_ids: set[int] | None = None,
         expected_finished_count: int = 0,
+        failed_recving: set[str] | None = None,
     ):
         self.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             invalid_block_ids=invalid_block_ids or set(),
+            failed_recving=failed_recving or set(),
             expected_finished_count=expected_finished_count,
         )
 
@@ -120,3 +122,34 @@ def test_aggregate_workers_output_with_expected_finished_count():
     # NOTE: This is to showcase dynamic update. Workers are responsible for
     # ensuring "req1" termination in this case
     assert aggregator._send_remaining_count["req1"] == 2
+
+
+def test_aggregate_failed_recving_waits_for_all_workers():
+    """A receive failure on any worker is reported once every worker finishes."""
+    aggregator = KVOutputAggregator(expected_finished_count=2)
+
+    # Worker 2 fails req1 but worker 1 has not finished receiving it yet.
+    aggregated = aggregator.aggregate(
+        [
+            DummyModelRunnerOutput(),
+            DummyModelRunnerOutput(finished_recving={"req1"}, failed_recving={"req1"}),
+        ]
+    ).kv_connector_output
+    assert aggregated.finished_recving is None
+    assert not aggregated.failed_recving
+
+    # Worker 1 finishes cleanly; the earlier failure is reported with it.
+    aggregated = aggregator.aggregate(
+        [
+            DummyModelRunnerOutput(finished_recving={"req1", "req2"}),
+            DummyModelRunnerOutput(finished_recving={"req2"}),
+        ]
+    ).kv_connector_output
+    assert aggregated.finished_recving == {"req1", "req2"}
+    assert aggregated.failed_recving == {"req1"}
+
+    # The failure is reported exactly once.
+    aggregated = aggregator.aggregate(
+        [DummyModelRunnerOutput(), DummyModelRunnerOutput()]
+    ).kv_connector_output
+    assert not aggregated.failed_recving

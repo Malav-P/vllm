@@ -1908,17 +1908,15 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
-        failed_kv_load_req_ids = None
+        failed_kv_load_req_ids: set[str] = set()
         if kv_connector_output and kv_connector_output.failed_recving:
-            failed_kv_load_req_ids = self._handle_failed_recving(
-                kv_connector_output.failed_recving
+            failed_kv_load_req_ids.update(
+                self._handle_failed_recving(kv_connector_output.failed_recving)
             )
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            if failed_kv_load_req_ids is None:
-                failed_kv_load_req_ids = set()
             failed_kv_load_req_ids.update(
                 self._handle_invalid_blocks(
                     kv_connector_output.invalid_block_ids,
@@ -3074,7 +3072,8 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
+            # One block-id list per KV cache group; single-group layouts are
+            # enforced by _handle_invalid_blocks.
             (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
@@ -3159,6 +3158,17 @@ class Scheduler(SchedulerInterface):
         Returns:
             Set of affected request IDs to skip in update_from_output main loop.
         """
+        if len(self.kv_cache_config.kv_cache_groups) > 1:
+            # Block IDs are only unique within a group, so a flat set of
+            # invalid block IDs cannot be mapped back to requests.
+            raise RuntimeError(
+                "A KV connector reported block-level load failures "
+                "(invalid_block_ids) on a layout with multiple KV cache "
+                "groups, where block IDs are only unique within a group. "
+                "Connectors must report failed requests via "
+                "KVConnectorTransferResults.failed_recving instead."
+            )
+
         should_fail = not self.recompute_kv_load_failures
 
         # handle async KV loads (not cached yet, evict_blocks=False)
