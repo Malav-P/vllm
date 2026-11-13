@@ -85,6 +85,17 @@ def _use_sheared_fa4() -> bool:
     return not (cap is not None and (cap.major, cap.minor) == (10, 3))
 
 
+@cache
+def _use_sm80_triton() -> bool:
+    """Neither FA4 path serves SM80 (A100): tml_fa4's sheared kernel is
+    Blackwell-only and the cute fallback's SM8x dispatch rejects score_mod
+    and paged KV. Route pre-SM90 devices through the Triton port adapted
+    from the ROCm implementation (``ops/sm80_attention.py``).
+    """
+    cap = current_platform.get_device_capability()
+    return cap is not None and cap.major < 9
+
+
 def _unshear_rel_logits(
     sheared: torch.Tensor,
     num_tokens: int,
@@ -187,6 +198,55 @@ def _fa4_rel_attention_cute(
     lse.copy_(ret[1])
 
 
+def _fa4_rel_attention_sm80(
+    q: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    *,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    window_size: tuple[int, int],
+    sheared_bias: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+) -> None:
+    """SM80 path (see ``_use_sm80_triton``): unshear the relative logits and
+    run the Triton kernel adapted from the ROCm port, writing the fp32 output
+    and natural-log LSE directly (no split-KV; ``num_splits`` is ignored).
+    """
+    from vllm.models.inkling2.ops.sm80_attention import sm80_rel_attention
+
+    rel_extent = sheared_bias.shape[-1] - 256
+    from torch._subclasses.fake_tensor import is_fake
+
+    if is_fake(q):
+        # JIT warmup traces under FakeTensorMode; the un-shear below is
+        # data-dependent, so trace with a shape-only view (values are never
+        # read under fake tensors) and skip the launch.
+        return
+    rel = _unshear_rel_logits(
+        sheared_bias, q.shape[0], cache_seqlens, cu_seqlens_q, rel_extent
+    )
+    sm80_rel_attention(
+        q,
+        key_cache,
+        value_cache,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        window_size=window_size,
+        rel_extent=rel_extent,
+        rel_logits=rel,
+        out=out,
+        lse=lse,
+    )
+
+
 class Inkling2FA4RelAttentionKernel(
     VllmJitKernel["Inkling2FA4RelAttentionKernel.CompileKey"]
 ):
@@ -232,6 +292,22 @@ class Inkling2FA4RelAttentionKernel(
         lse: torch.Tensor,
     ) -> None:
         """Write ``out`` and the ``(num_heads, num_tokens)`` LSE ``lse``."""
+        if _use_sm80_triton():
+            _fa4_rel_attention_sm80(
+                q,
+                key_cache,
+                value_cache,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                softmax_scale=softmax_scale,
+                window_size=window_size,
+                sheared_bias=sheared_bias,
+                out=out,
+                lse=lse,
+            )
+            return
         if not _use_sheared_fa4():
             _fa4_rel_attention_cute(
                 q,
@@ -415,9 +491,11 @@ def _gate_sink_kernel(
     stride_sink,
     H: tl.constexpr,
     D: tl.constexpr,
+    USE_PDL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = col < H * D
@@ -463,9 +541,10 @@ def gate_sink(
         sinks.stride(0),
         num_heads,
         width // num_heads,
+        current_platform.is_arch_support_pdl(),
         512,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
 
 

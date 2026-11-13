@@ -5,6 +5,7 @@ input quantization."""
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
 
 from .mxfp8 import _mxfp8_block, _store_mxfp8_block
@@ -138,12 +139,13 @@ def _situ_quantize_kernel(
     TILE: tl.constexpr,
     NVFP4: tl.constexpr,
     LAUNCH_DEPENDENTS: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     # Each program quantizes columns [start, start + HEAD + TAIL) of its rows
     # (NVFP4: whole rows, for the row amax). The routing outputs and weight
     # scales are read before waiting for the gate/up GEMM, which launches this
     # kernel only after its own wait for the routing kernel.
-    if LAUNCH_DEPENDENTS:
+    if LAUNCH_DEPENDENTS and USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
     num_rows = tl.load(NumRows)
     r = tl.program_id(0)
@@ -153,7 +155,8 @@ def _situ_quantize_kernel(
     denominator = 0.0
     if NVFP4:
         denominator = 1536.0 * tl.load(WDenominator)
-    tl.extra.cuda.gdc_wait()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
     start = tl.program_id(1) * (HEAD + TAIL)
     while r < num_rows:
         head = _situ(X, row, start, gamma, N, HEAD, GATE_CAP, UP_CAP)
@@ -270,9 +273,10 @@ def swiglu_quantize(
         TILE=tile,
         NVFP4=nvfp4,
         LAUNCH_DEPENDENTS=max_rows <= LAUNCH_DEPENDENTS_MAX_ROWS,
+        USE_PDL=current_platform.is_arch_support_pdl(),
         num_warps=num_warps,
         maxnreg=maxnreg,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return values, scales, row_scales

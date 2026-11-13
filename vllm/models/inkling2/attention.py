@@ -48,6 +48,7 @@ from .configs import Inkling2ModelConfig
 from .lora import add_linear_lora
 from .ops.attention import (
     _INKLING2_FA4_REL_ATTENTION_KERNEL,
+    _use_sm80_triton,
     gate_sink,
     plan_attention,
     plan_decode_attention,
@@ -434,6 +435,11 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         """Return ``(num_decodes, num_decode_tokens, num_splits)`` for
         ``rel_decode_attention``: the whole batch, or in a mixed batch the
         leading decode/verify requests."""
+        if _use_sm80_triton():
+            # The gluon split-KV decode kernel needs Hopper+ TMA. On SM80
+            # every request — decode included — runs the Triton FA4 path,
+            # which applies the gate/sink epilogue via ``gate_sink``.
+            return 0, 0, 0
         num_reqs = md.seq_lens.shape[0]
         plan = partial(
             plan_decode_attention,
