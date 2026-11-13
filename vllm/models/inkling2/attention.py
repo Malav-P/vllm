@@ -220,7 +220,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if vllm_config.kernel_config.enable_jit_warmup:
             _INKLING2_FA4_REL_ATTENTION_KERNEL.register_warmup()
 
-    def process_weights_after_loading(self) -> None:
+    def process_weights_after_loading(self, act_dtype: torch.dtype | None = None) -> None:
+        # Trunk's loader passes the model dtype to attention layers.
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
 
     def get_attn_backend(self) -> type[AttentionBackend]:

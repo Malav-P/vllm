@@ -22,7 +22,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-_M_LN2 = 0.6931471805599453
+_M_LN2 = tl.constexpr(0.6931471805599453)
 
 
 @triton.heuristics(
@@ -111,6 +111,7 @@ def _sm80_rel_attention_kernel(
     q_valid = q_rows < q_len
     off_d = tl.arange(0, BLOCK_D)
     d_valid = off_d < head_dim
+    off_h = tl.arange(0, BLOCK_H)
 
     m_i = tl.full((BLOCK_QH,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_QH,), dtype=tl.float32)
@@ -144,7 +145,6 @@ def _sm80_rel_attention_kernel(
 
         # rel_logits is query- and head-dependent. Expand [Q, K] distance
         # indices across the GQA heads, then flatten to match QK's row order.
-        off_h = tl.arange(0, BLOCK_H)
         rel_dist = dist[:, None, :]
         rel_valid = (
             q_valid[:, None, None]

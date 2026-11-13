@@ -22,10 +22,14 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 
-from .ops.activation import swiglu_quantize
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.platforms import current_platform
+
+from .ops.activation import situ_bf16, swiglu_quantize
 from .ops.block_scales import shuffle_rows, swizzle_block_scales
 from .ops.moe import NUM_COUNTERS, combine, combine_push, route
 from .ops.seq_parallel import SeqParallel
+from .ops.linear import linear_k_groups
 from .ops.trtllm_bmm import bmm, expert_plan, load_kernels
 
 QuantFormat = Literal["nvfp4", "mxfp8"]
@@ -81,6 +85,26 @@ class Inkling2Gate(nn.Module):
         )
 
 
+def _use_marlin_experts() -> bool:
+    """The TRT-LLM-gen expert cubins are SM100-only; other GPUs run the
+    checkpoint's NVFP4 / MXFP8 weights through Marlin (bf16 activations)."""
+    return current_platform.get_device_capability().major != 10
+
+
+class _MarlinExpertsPostLoad(QuantizeMethodBase):
+    """Hooks ``Inkling2Experts`` into the loader's post-load pass to repack
+    its weights for Marlin."""
+
+    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
+        raise NotImplementedError
+
+    def apply(self, layer: nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        layer.prepare_marlin()
+
+
 class Inkling2Experts(nn.Module):
     def __init__(self, config, quant_format: QuantFormat) -> None:
         super().__init__()
@@ -92,6 +116,7 @@ class Inkling2Experts(nn.Module):
         self.gate_cap = config.mlp_gate_softcap
         self.up_cap = config.mlp_up_softcap
         self.nvfp4 = quant_format == "nvfp4"
+        self.marlin = _use_marlin_experts()
         hidden, inter = config.hidden_size, config.intermediate_size
         self.hidden_size, self.intermediate_size = hidden, inter
 
@@ -101,17 +126,18 @@ class Inkling2Experts(nn.Module):
         self.shapes = ((2 * inter, hidden), (hidden, inter))
         for name, (n, k) in zip(("w13", "w2"), self.shapes):
             # Rows are shuffled and block scales swizzled (``block_scales``).
+            # Marlin repacks the plain checkpoint layout after loading.
             self._register(
                 f"{name}_weight",
                 (n, k // pack),
                 weight_dtype,
-                loader=self._load_weight,
+                loader=None if self.marlin else self._load_weight,
             )
             self._register(
                 f"{name}_weight_scale",
                 (n, k // group),
                 scale_dtype,
-                loader=self._load_block_scales,
+                loader=None if self.marlin else self._load_block_scales,
             )
             if self.nvfp4:
                 self._register(f"{name}_weight_amax", (), torch.float32)
@@ -135,6 +161,14 @@ class Inkling2Experts(nn.Module):
         self.register_buffer(
             "ones", torch.ones(self.num_experts, dtype=torch.float32), persistent=False
         )
+        if self.marlin:
+            self.quant_method = _MarlinExpertsPostLoad()
+            expert_map = torch.full((config.n_routed_experts,), -1, dtype=torch.int32)
+            expert_map[start : start + self.num_experts] = torch.arange(
+                self.num_experts, dtype=torch.int32
+            )
+            self.register_buffer("expert_map", expert_map, persistent=False)
+            return
         load_kernels(
             (self.w13_weight, self.w2_weight),
             (self.w13_weight_scale, self.w2_weight_scale),
@@ -175,6 +209,106 @@ class Inkling2Experts(nn.Module):
             f"{loaded.shape} {loaded.dtype} != {param.shape} {param.dtype}"
         )
         param.data.copy_(loaded)
+
+    def prepare_marlin(self) -> None:
+        """Repack the loaded checkpoint weights for ``fused_marlin_moe``.
+
+        w13 rows interleave (gate, up); Marlin takes the gate rows, then the
+        up rows. NVFP4 weights are ``e2m1 * block_scale * amax / denominator``
+        (ModelOpt's convention, with ``weight_scale_2 = amax / denominator``).
+        """
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            prepare_nvfp4_moe_layer_for_marlin,
+        )
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+            prepare_mxfp8_moe_layer_for_marlin,
+        )
+        from vllm.scalar_type import scalar_types
+        from vllm.utils.torch_utils import set_default_torch_dtype
+
+        def gate_then_up(t: torch.Tensor) -> torch.Tensor:
+            return torch.cat([t[:, 0::2], t[:, 1::2]], dim=1)
+
+        w13 = gate_then_up(self.w13_weight.data)
+        w13_scale = gate_then_up(self.w13_weight_scale.data)
+        w2, w2_scale = self.w2_weight.data, self.w2_weight_scale.data
+        names = ["w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"]
+        self.intermediate_size_per_partition = self.intermediate_size
+        self.params_dtype = torch.bfloat16
+        with set_default_torch_dtype(torch.bfloat16):
+            if self.nvfp4:
+                w13_global = (
+                    self.w13_weight_amax.data
+                    / self.w13_weight_outer_scale_denominator.data
+                ).float()
+                w2_global = (
+                    self.w2_weight_amax.data
+                    / self.w2_weight_outer_scale_denominator.data
+                ).float()
+                w13, w13_scale, w13_global, w2, w2_scale, w2_global = (
+                    prepare_nvfp4_moe_layer_for_marlin(
+                        self, w13, w13_scale, w13_global, w2, w2_scale, w2_global,
+                        is_act_and_mul=True,
+                    )
+                )
+                names += [
+                    "w13_weight_amax",
+                    "w2_weight_amax",
+                    "w13_weight_outer_scale_denominator",
+                    "w2_weight_outer_scale_denominator",
+                ]
+                self.marlin_global_scales = (w13_global, w2_global)
+                self.marlin_quant_type = scalar_types.float4_e2m1f
+            else:
+                w13, w2, w13_scale, w2_scale = prepare_mxfp8_moe_layer_for_marlin(
+                    self, w13, w2, w13_scale, w2_scale
+                )
+                self.marlin_global_scales = (None, None)
+                self.marlin_quant_type = scalar_types.float8_e4m3fn
+        for name in names:
+            delattr(self, name)
+        self.marlin_weights = (w13, w2, w13_scale, w2_scale)
+
+    def forward_marlin(self, x: torch.Tensor, gate: "Inkling2Gate") -> torch.Tensor:
+        """bf16 [T, H] -> bf16 [T, H]: routing in torch (the reference's
+        fp32 k-group logits, selection by ``sigmoid + bias``, renormalized
+        sigmoid weights), experts on Marlin, routing weight after w2."""
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+            fused_marlin_moe,
+        )
+
+        logits = linear_k_groups(x, gate.weight, torch.float32)
+        scores = torch.sigmoid(logits)
+        ids = torch.topk(scores + gate.bias, self.topk, dim=-1, sorted=False)[1]
+        weights = scores.gather(1, ids)
+        weights = weights / weights.sum(-1, keepdim=True) * gate.route_scale
+        w13, w2, w13_scale, w2_scale = self.marlin_weights
+        global1, global2 = self.marlin_global_scales
+
+        def activation(_act, out, gate_up, **_):
+            situ_bf16(gate_up, out, self.gate_cap, self.up_cap)
+
+        out = fused_marlin_moe(
+            x,
+            w13,
+            w2,
+            None,
+            None,
+            w13_scale,
+            w2_scale,
+            weights,
+            ids.to(torch.int32),
+            self.marlin_quant_type.id,
+            global_num_experts=self.expert_map.numel(),
+            activation=MoEActivation.SILU,
+            activation_func=activation,
+            expert_map=self.expert_map,
+            global_scale1=global1,
+            global_scale2=global2,
+            workspace=self.workspace,
+        )
+        return out if self.ep_size == 1 else tensor_model_parallel_all_reduce(out)
 
     def plan(self, tokens: int):
         return expert_plan(tokens, self.topk, self.num_experts, self.nvfp4, self.shapes)
@@ -270,6 +404,12 @@ class Inkling2MoE(nn.Module):
             )
         x = x.contiguous()
         gate, experts = self.gate, self.experts
+        if experts.marlin:
+            if not reduce or push is not None:
+                raise NotImplementedError(
+                    "Inkling2 Marlin experts return the reduced output only"
+                )
+            return experts.forward_marlin(x, gate)
         plan = experts.plan(x.shape[0])
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():

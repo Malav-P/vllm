@@ -105,9 +105,10 @@ def _unshear_rel_logits(
 ) -> torch.Tensor:
     """Invert ``attention_prologue``'s shearing for the fallback path: rebuild
     the plain ``(T, H, rel_extent)`` relative logits from the sheared
-    ``(T + 128, H, rel_extent + 256)`` table. In the sheared layout, column
-    ``c`` of a token in a 128-row tile whose key blocks end at ``n_max``
-    holds the key at ``c + (n_max - 10) * 128``; padding is NaN and becomes 0
+    ``(T + 128, H, rel_extent + 256)`` table. In the sheared layout, the
+    diagonal key (distance 0) of a token in a 128-row tile whose key blocks
+    end at ``n_max`` sits at column ``pos + (rel_extent + 256) - n_max * 128``,
+    i.e. column ``c`` holds distance ``diag - c``; padding is NaN and becomes 0
     here (out-of-range columns are masked or clamped away by the score_mod).
 
     This runs inside CUDA graph capture: device tensor ops only — no
@@ -125,7 +126,7 @@ def _unshear_rel_logits(
     pos = past[req] + i_loc
     tile_end = torch.minimum((i_loc // 128 + 1) * 128, q_lens[req])
     n_max = (past[req] + tile_end + 127) // 128
-    offset = (n_max - 10) * 128
+    offset = n_max * 128 - (rel_extent + 256)
     # dist d of token i lives at sheared column pos(i) - d - offset(i).
     d = torch.arange(rel_extent, device=device)
     cols = pos[:, None] - d[None, :] - offset[:, None]

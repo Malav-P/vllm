@@ -7,7 +7,6 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.flashinfer import is_flashinfer_autotuning
 
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
 # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
@@ -22,12 +21,9 @@ def linear(
     if out is not None:
         assert x.shape[0] > LOW_M_MAX_TOKENS
         return torch.mm(x, weight.t(), out=out)
-    # Autotuning would profile the CuTe DSL kernels past their 32-row limit.
-    if x.shape[0] > LOW_M_MAX_TOKENS or is_flashinfer_autotuning():
-        return torch.nn.functional.linear(x, weight)
-    from flashinfer import mm_bf16
-
-    return mm_bf16(x, weight.t(), pdl=True, backend="cute-dsl")
+    # The image's flashinfer CuTe-DSL small-batch path is unavailable on
+    # this base; torch.linear keeps the same fp32-accumulate semantics.
+    return torch.nn.functional.linear(x, weight)
 
 
 @triton.jit

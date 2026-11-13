@@ -280,3 +280,35 @@ def swiglu_quantize(
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return values, scales, row_scales
+
+
+@triton.jit
+def _situ_bf16_kernel(
+    X, Y, stride_x, N: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < N
+    gate = tl.load(X + row * stride_x + cols, mask, other=0).to(tl.float32)
+    up = tl.load(X + row * stride_x + N + cols, mask, other=0).to(tl.float32)
+    sigmoid = _sigmoid_approx(gate)
+    y = (_softcap(gate, GATE_CAP) * sigmoid) * _softcap(up, UP_CAP)
+    tl.store(Y + row * N + cols, y.to(tl.bfloat16), mask)
+
+
+def situ_bf16(
+    x: torch.Tensor, out: torch.Tensor, gate_cap: float, up_cap: float
+) -> None:
+    """bf16 ``softcap(gate) * sigmoid(gate) * softcap(up)`` of ``x`` [M, 2N]
+    with (gate, up) halves into ``out`` [M, N]; the routing weight is applied
+    after the down projection (pre-SM100 Marlin experts)."""
+    rows, n = out.shape
+    assert x.shape == (rows, 2 * n) and x.stride(1) == 1 and out.is_contiguous()
+    if rows == 0:
+        return
+    block = 1024
+    _situ_bf16_kernel[(rows, triton.cdiv(n, block))](
+        x, out, x.stride(0), N=n, GATE_CAP=gate_cap, UP_CAP=up_cap, BLOCK=block,
+        enable_fp_fusion=False,
+    )
