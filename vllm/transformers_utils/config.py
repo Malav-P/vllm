@@ -139,6 +139,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     **{"unlimited-ocr": "UnlimitedOCRConfig"},
     inkling_mm_model="InklingMMConfig",
     inkling_model="InklingModelConfig",
+    inkling2="Inkling2MMConfig",
+    inkling2_model="Inkling2ModelConfig",
 )
 
 _SPECULATIVE_DECODING_CONFIGS: set[str] = {"eagle", "speculators", "medusa"}
