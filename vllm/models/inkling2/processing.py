@@ -185,38 +185,41 @@ class Inkling2DummyInputsBuilder(BaseDummyInputsBuilder[Inkling2ProcessingInfo])
         }
 
 
-class Inkling2MultiModalProcessor(BaseMultiModalProcessor[Inkling2ProcessingInfo]):
-    # Prompts arrive as token ids and the update target is a single token id.
-    requires_tokenizer = False
-
-    def get_dummy_inputs(
+    def get_dummy_processor_inputs(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
         mm_options: MultiModalDummyOptions,
     ) -> ProcessorInputs:
         # Build marker ids directly: the tokenizer may not parse special text.
-        mm_data = self.dummy_inputs.get_dummy_mm_data(seq_len, mm_counts, mm_options)
+        mm_data = self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
         return ProcessorInputs(
             prompt=[IMAGE_MARKER_ID] * mm_counts.get("image", 0),
             mm_data_items=self.info.parse_mm_data(mm_data, validate=False),
         )
 
+
+class Inkling2MultiModalProcessor(BaseMultiModalProcessor[Inkling2ProcessingInfo]):
+    # Prompts arrive as token ids and the update target is a single token id.
+    requires_tokenizer = False
+
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_kwargs: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        hf_data, hf_kwargs, passthrough_data = self._get_hf_mm_inputs(
-            mm_items, hf_kwargs
+        valid_items = mm_items.select(
+            {k for k, c in mm_items.get_all_counts().items() if c > 0}
         )
+        processor_data, passthrough_data = self._get_hf_mm_data(valid_items)
         images = mm_items.get("image")
-        processed = None
+        processed = BatchFeature()
         if isinstance(images, ImageProcessorItems) and images.get_count():
             # Raw items keep MediaWithBytes.original_bytes for exact decoding.
             processed = BatchFeature(self.info.image_processor.preprocess(images.data))
-        return self._finalize_hf_mm_data(
-            hf_data, hf_kwargs, passthrough_data, processed
+        processed.update(passthrough_data)
+        return self._postprocess_hf_mm_data(
+            processor_data, hf_processor_mm_kwargs, processed
         )
 
     def _get_mm_fields_config(
