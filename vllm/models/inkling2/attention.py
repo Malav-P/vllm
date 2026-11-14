@@ -30,7 +30,6 @@ from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backend import (
     AttentionBackend,
     CommonAttentionMetadata,
-    max_decode_query_len,
 )
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -58,6 +57,16 @@ from .ops.linear import linear
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 
+
+
+def max_decode_query_len(vllm_config: VllmConfig) -> int:
+    """Widest request a spec-as-decode builder treats as a decode: a
+    verification request plus the drafter's extra slots (upstream's
+    ``vllm.v1.attention.backend.max_decode_query_len``, not in this base)."""
+    spec = vllm_config.speculative_config
+    if spec is None or spec.num_speculative_tokens is None:
+        return 1
+    return 1 + spec.num_speculative_tokens + spec.max_num_new_slots_for_drafting
 
 @dataclass
 class Inkling2AttentionMetadata(FlashAttentionMetadata):

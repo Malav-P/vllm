@@ -20,7 +20,7 @@ import torch
 from PIL import Image
 from transformers.feature_extraction_utils import BatchFeature
 
-from vllm.config.multimodal import MultiModalDummyOptions
+from vllm.config.multimodal import MMDummyOptions as MultiModalDummyOptions
 from vllm.inputs import MultiModalDataDict
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.media import MediaWithBytes
