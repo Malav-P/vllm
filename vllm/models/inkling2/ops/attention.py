@@ -119,9 +119,18 @@ def _unshear_rel_logits(
     num_heads = sheared.shape[1]
     q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.long)
     past = cache_seqlens.to(torch.long) - q_lens
-    req = torch.repeat_interleave(
-        torch.arange(q_lens.shape[0], device=device), q_lens, output_size=num_tokens
-    )
+    # Graph replay pads the token dim to the capture size, beyond
+    # cu_seqlens_q's coverage; attribute those rows to the last request
+    # (their outputs are discarded). searchsorted avoids repeat_interleave's
+    # output_size, which must equal sum(q_lens) and so cannot express the
+    # padded rows. req[t] = number of cu_seqlens boundaries <= t, minus the
+    # one that starts t's own request.
+    req = (
+        torch.searchsorted(
+            cu_seqlens_q, torch.arange(num_tokens, device=device), right=True
+        )
+        - 1
+    ).clamp(min=0, max=q_lens.shape[0] - 1)
     i_loc = torch.arange(num_tokens, device=device) - cu_seqlens_q[:-1].to(torch.long)[req]
     pos = past[req] + i_loc
     tile_end = torch.minimum((i_loc // 128 + 1) * 128, q_lens[req])
