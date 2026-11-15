@@ -4,8 +4,9 @@
 
 Each decoder layer owns one ``InklingConvState`` (shared with Inkling v1)
 holding its four conv streams (K, V, attn-out, mlp-out) packed head-major. K/V
-are TP-sharded with the KV heads; the attn-/mlp-output streams are replicated
-full-width on every rank (``replicate_hidden=True``).
+are TP-sharded with the KV heads; the attn-/mlp-output streams are
+channel-sharded (``replicate_hidden=False``): each rank convolves and caches
+``hidden / tp`` channels of them.
 """
 
 from typing import cast

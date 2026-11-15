@@ -269,10 +269,14 @@ class Inkling2Experts(nn.Module):
             delattr(self, name)
         self.marlin_weights = (w13, w2, w13_scale, w2_scale)
 
-    def forward_marlin(self, x: torch.Tensor, gate: "Inkling2Gate") -> torch.Tensor:
+    def forward_marlin(
+        self, x: torch.Tensor, gate: "Inkling2Gate", reduce: bool = True
+    ) -> torch.Tensor:
         """bf16 [T, H] -> bf16 [T, H]: routing in torch (the reference's
         fp32 k-group logits, selection by ``sigmoid + bias``, renormalized
-        sigmoid weights), experts on Marlin, routing weight after w2."""
+        sigmoid weights), experts on Marlin, routing weight after w2. Without
+        ``reduce``, the local experts' partial rows (EP > 1), i.e. the summed
+        contribution of this rank's experts, for the caller to reduce."""
         from vllm.model_executor.layers.fused_moe.activation import MoEActivation
         from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
             fused_marlin_moe,
@@ -308,7 +312,9 @@ class Inkling2Experts(nn.Module):
             global_scale2=global2,
             workspace=self.workspace,
         )
-        return out if self.ep_size == 1 else tensor_model_parallel_all_reduce(out)
+        if not reduce or self.ep_size == 1:
+            return out
+        return tensor_model_parallel_all_reduce(out)
 
     def plan(self, tokens: int):
         return expert_plan(tokens, self.topk, self.num_experts, self.nvfp4, self.shapes)
@@ -391,8 +397,9 @@ class Inkling2MoE(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """bf16 [T, H] -> bf16 [T, H], reduced over the expert-parallel group;
         without ``reduce``, the unreduced ``(down, src2dst)`` of
-        ``Inkling2Experts``, or (with ``push``) pushes this rank's partial sums
-        to the token shard owners.
+        ``Inkling2Experts`` (the Marlin experts return their summed local
+        partial rows instead), or (with ``push``) pushes this rank's partial
+        sums to the token shard owners.
         Padding tokens (``is_padding`` of the forward context) are routed to
         no expert and come out as 0. ``lora`` (``Inkling2MoEWithLoRA``) adds
         per-expert LoRA deltas inside the expert GEMMs, before any reduce or
@@ -405,11 +412,14 @@ class Inkling2MoE(nn.Module):
         x = x.contiguous()
         gate, experts = self.gate, self.experts
         if experts.marlin:
-            if not reduce or push is not None:
+            if push is not None:
                 raise NotImplementedError(
-                    "Inkling2 Marlin experts return the reduced output only"
+                    "Inkling2 Marlin experts do not support the Lamport push path"
                 )
-            return experts.forward_marlin(x, gate)
+            # The Marlin experts apply the routing weights inside, so unlike
+            # the TRT-LLM path ``reduce=False`` returns the summed local
+            # partial rows directly (no ``src2dst`` combine).
+            return experts.forward_marlin(x, gate, reduce=reduce)
         plan = experts.plan(x.shape[0])
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():

@@ -18,10 +18,12 @@ from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -62,6 +64,7 @@ from .moe import Inkling2MoE, QuantFormat
 from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
+from .ops.moe import combine
 from .ops.norm import rms_norm
 from .ops.seq_parallel import SeqParallel
 from .processing import (
@@ -150,13 +153,16 @@ class Inkling2DecoderLayer(nn.Module):
             if self.is_local
             else config.num_key_value_heads
         )
+        # The attn-/mlp-output conv streams are channel-sharded with TP (each
+        # rank convolves and caches hidden / tp channels of them; the depthwise
+        # conv is exact under any channel partition). K/V stay with the KV heads.
         self.conv_state = InklingConvState(
             num_kv_heads=num_kv_heads,
             head_dim=config.swa_head_dim if self.is_local else config.head_dim,
             hidden_size=config.hidden_size,
             kernel_size=config.sconv_kernel_size,
             prefix=f"{prefix}.conv_state",
-            replicate_hidden=True,
+            replicate_hidden=False,
         )
         self.attn = Inkling2Attention(
             config, self.is_local, self.conv_state, prefix=f"{prefix}.attn"
@@ -174,9 +180,14 @@ class Inkling2DecoderLayer(nn.Module):
             else "nvfp4"
         )
         self.mlp = Inkling2MoE(config, expert_format)
+        # Conv weights for this rank's hidden channels; the loader narrows the
+        # checkpoint's full-width taps by tp rank.
         self.attn_sconv, self.mlp_sconv = (
             Inkling2ShortConv(
-                config.hidden_size, config.sconv_kernel_size, self.conv_state, stream
+                config.hidden_size // get_tensor_model_parallel_world_size(),
+                config.sconv_kernel_size,
+                self.conv_state,
+                stream,
             )
             for stream in (ATTN_STREAM, MLP_STREAM)
         )
@@ -205,6 +216,9 @@ class Inkling2Model(nn.Module):
         self.config = config
         self.block_size = config.n_layers_per_attn_res_block
         self.normalize_values = config.attn_res_normalize_values
+        # This rank's channel range of the hidden conv streams (TP).
+        self.hidden_shard = config.hidden_size // get_tensor_model_parallel_world_size()
+        self.ch_begin = get_tensor_model_parallel_rank() * self.hidden_shard
         self.embed_tokens = VocabParallelEmbedding(
             config.padded_vocab_size, config.hidden_size
         )
@@ -266,7 +280,10 @@ class Inkling2Model(nn.Module):
         # all-reduce, larger ones run it on the all-reduced input. Large
         # batches keep a token shard of the hidden stream on each rank
         # (reduce-scatter, then `conv_mix`), also in profile runs (no
-        # conv-state cache) for their memory use.
+        # conv-state cache) for their memory use. Without the Lamport
+        # workspace (A100), each sublayer reduce-scatters its partial sums to
+        # this rank's hidden channels instead, convolves them there
+        # (channel-sharded conv state) and all-gathers the conv output.
         workspace = self.allreduce_workspace
         plan = [(False, False)] * 2
         has_cache = conv_metadata(self.layers[0].conv_state) is not None
@@ -353,9 +370,16 @@ class Inkling2Model(nn.Module):
                     attn_reduced = tensor_model_parallel_all_reduce(attn_partial)
                     mlp_in = layer.attn_sconv.conv_mix(attn_reduced, *mix_args)
             else:
-                attn_out = layer.attn_sconv(
-                    tensor_model_parallel_all_reduce(attn_partial), positions
+                # Channel-sharded hidden convs: reduce-scatter the partial sums
+                # to this rank's hidden channels, convolve them there, and
+                # all-gather the conv output for the full-width AttnRes mix.
+                # At TP 1 the collectives are identity and the full width is
+                # convolved at once (the head-major cache layout is the same).
+                attn_shard = layer.attn_sconv(
+                    tensor_model_parallel_reduce_scatter(attn_partial, dim=1),
+                    positions,
                 )
+                attn_out = tensor_model_parallel_all_gather(attn_shard, dim=1)
                 if first:
                     mlp_in = self._mix(
                         stack[: num_blocks + 1], attn_out, mlp_query, layer.mlp_norm
@@ -370,12 +394,30 @@ class Inkling2Model(nn.Module):
                 num_blocks += 1
             inputs = None
             if sp is None and not conv_mix:
-                layer.mlp_sconv(
-                    layer.mlp(mlp_in[0]),
+                mlp_partial = layer.mlp(mlp_in[0], reduce=False)
+                if isinstance(mlp_partial, tuple):
+                    # TRT-LLM experts without the Lamport workspace: combine
+                    # their (rows, src2dst) locally before the scatter.
+                    down, src2dst = mlp_partial
+                    mlp_partial = combine(
+                        down, src2dst, layer.mlp.experts.topk, mlp_in[0].dtype
+                    )
+                mlp_shard = tensor_model_parallel_reduce_scatter(mlp_partial, dim=1)
+                residual_shard = (
+                    None
+                    if residual is None
+                    else residual[
+                        :, self.ch_begin : self.ch_begin + self.hidden_shard
+                    ].contiguous()
+                )
+                out_shard = layer.mlp_sconv(
+                    mlp_shard,
                     positions,
-                    addend=attn_out,
-                    residual=residual,
-                    out=stack[num_blocks],
+                    addend=attn_shard,
+                    residual=residual_shard,
+                )
+                stack[num_blocks].copy_(
+                    tensor_model_parallel_all_gather(out_shard, dim=1)
                 )
                 continue
             if i + 1 < num_layers:
