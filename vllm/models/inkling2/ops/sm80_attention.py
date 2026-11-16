@@ -48,6 +48,7 @@ def _sm80_rel_attention_kernel(
     gqa_group_size,
     head_dim,
     softmax_scale,
+    num_splits,
     stride_q_t,
     stride_q_h,
     stride_q_d,
@@ -62,9 +63,11 @@ def _sm80_rel_attention_kernel(
     stride_r_t,
     stride_r_h,
     stride_r_e,
+    stride_o_s,
     stride_o_t,
     stride_o_h,
     stride_o_d,
+    stride_lse_s,
     stride_lse_h,
     stride_lse_t,
     stride_bt_b,
@@ -80,7 +83,9 @@ def _sm80_rel_attention_kernel(
     # A program owns BLOCK_Q query positions and every query head sharing one
     # KV head; rows are flattened to (BLOCK_Q * BLOCK_H, BLOCK_D) for the QK
     # and PV dots. Adapted from the ROCm kernel of the same shape.
-    pid_q = tl.program_id(0)
+    pid = tl.program_id(0)
+    pid_q = pid // num_splits
+    pid_s = pid % num_splits
     pid_kh = tl.program_id(1)
     pid_b = tl.program_id(2)
 
@@ -94,6 +99,21 @@ def _sm80_rel_attention_kernel(
     prefix_len = kv_len - q_len
     q_head_start = pid_kh * gqa_group_size
     bt_row = block_table_ptr + pid_b * stride_bt_b
+
+    # Keys this q-block can attend: causally bounded by its last query,
+    # lower-bounded by the sliding window at its first query. Split-KV then
+    # shards the surviving range; empty shards still emit their -inf LSE
+    # partial for the combine pass in the launcher.
+    q_abs_first = prefix_len + q_block
+    q_abs_last = prefix_len + tl.minimum(q_block + BLOCK_Q, q_len) - 1
+    k_begin = 0
+    if window_left >= 0:
+        k_begin = tl.maximum(0, q_abs_first - window_left)
+    k_end = tl.minimum(kv_len, q_abs_last + 1)
+    tiles = (k_end - k_begin + BLOCK_K - 1) // BLOCK_K
+    tiles_per_split = (tiles + num_splits - 1) // num_splits
+    split_begin = k_begin + pid_s * tiles_per_split * BLOCK_K
+    split_end = tl.minimum(k_end, split_begin + tiles_per_split * BLOCK_K)
 
     q_block_ptr = tl.make_block_ptr(
         base=q_ptr + q_start * stride_q_t + q_head_start * stride_q_h,
@@ -118,7 +138,7 @@ def _sm80_rel_attention_kernel(
     acc = tl.zeros((BLOCK_QH, BLOCK_D), dtype=tl.float32)
     log2e: tl.constexpr = 1.4426950408889634
 
-    for k_start in range(0, kv_len, BLOCK_K):
+    for k_start in range(split_begin, split_end, BLOCK_K):
         k_pos = k_start + tl.arange(0, BLOCK_K)
         k_valid = k_pos < kv_len
         # Masked lanes still need an in-range page-table load.
@@ -145,24 +165,27 @@ def _sm80_rel_attention_kernel(
 
         # rel_logits is query- and head-dependent. Expand [Q, K] distance
         # indices across the GQA heads, then flatten to match QK's row order.
-        rel_dist = dist[:, None, :]
-        rel_valid = (
-            q_valid[:, None, None]
-            & (off_h[None, :, None] < gqa_group_size)
-            & score_valid[:, None, :]
-            & (rel_dist < rel_extent)
-        )
-        safe_dist = tl.maximum(0, tl.minimum(rel_dist, rel_extent - 1))
-        bias = tl.load(
-            rel_ptr
-            + (q_start + q_rows[:, None, None]) * stride_r_t
-            + (q_head_start + off_h[None, :, None]) * stride_r_h
-            + safe_dist * stride_r_e,
-            mask=rel_valid,
-            other=0.0,
-        )
-        bias = tl.reshape(bias, (BLOCK_QH, BLOCK_K))
-        scores += bias.to(tl.float32) * log2e
+        # The bias only reaches rel_extent back; a tile whose every (q, k)
+        # pair is older than that contributes zero bias, so skip its gather.
+        if q_abs_first - (k_start + BLOCK_K - 1) < rel_extent:
+            rel_dist = dist[:, None, :]
+            rel_valid = (
+                q_valid[:, None, None]
+                & (off_h[None, :, None] < gqa_group_size)
+                & score_valid[:, None, :]
+                & (rel_dist < rel_extent)
+            )
+            safe_dist = tl.maximum(0, tl.minimum(rel_dist, rel_extent - 1))
+            bias = tl.load(
+                rel_ptr
+                + (q_start + q_rows[:, None, None]) * stride_r_t
+                + (q_head_start + off_h[None, :, None]) * stride_r_h
+                + safe_dist * stride_r_e,
+                mask=rel_valid,
+                other=0.0,
+            )
+            bias = tl.reshape(bias, (BLOCK_QH, BLOCK_K))
+            scores += bias.to(tl.float32) * log2e
         score_valid = tl.reshape(
             score_valid[:, None, :] & (off_h[None, :, None] < gqa_group_size),
             (BLOCK_QH, BLOCK_K),
@@ -194,10 +217,13 @@ def _sm80_rel_attention_kernel(
         acc += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
 
-    acc /= l_i[:, None]
+    # An empty shard (or a fully window-masked one) has l_i == 0; keep its
+    # partial at zero so the combine pass discards it via its -inf LSE.
+    acc = acc / tl.where(l_i > 0, l_i, 1.0)[:, None]
     acc = tl.reshape(acc, (BLOCK_Q, BLOCK_H, BLOCK_D))
     out_block_ptr = tl.make_block_ptr(
-        base=out_ptr + q_start * stride_o_t + q_head_start * stride_o_h,
+        base=out_ptr + pid_s * stride_o_s
+        + q_start * stride_o_t + q_head_start * stride_o_h,
         shape=(q_len, gqa_group_size, head_dim),
         strides=(stride_o_t, stride_o_h, stride_o_d),
         offsets=(q_block, 0, 0),
@@ -220,6 +246,7 @@ def _sm80_rel_attention_kernel(
     lse = tl.reshape(lse, (BLOCK_Q, BLOCK_H))
     lse_ptrs = (
         lse_ptr
+        + pid_s * stride_lse_s
         + (q_head_start + off_h[None, :]) * stride_lse_h
         + (q_start + q_rows[:, None]) * stride_lse_t
     )
@@ -246,12 +273,18 @@ def sm80_rel_attention(
     rel_logits: torch.Tensor,
     out: torch.Tensor,
     lse: torch.Tensor,
+    num_splits: int | None = None,
 ) -> None:
     """Paged varlen relative attention writing fp32 ``out`` and the
     ``(num_heads, total_q)`` natural-log ``lse``.
 
     Bias semantics match the sheared kernel: ``exp(qk * scale + bias)`` with
     ``bias = rel_logits[t, h, q_abs - k_pos]`` (no bias past ``rel_extent``).
+
+    The KV scan is clamped to the keys the q-block can actually attend
+    (causal upper bound, sliding-window lower bound), tiles older than
+    ``rel_extent`` skip the bias gather, and small launches (decode) shard
+    the scan across programs, merging the per-split partials by LSE weight.
     """
     if window_size[1] not in (0, -1):
         raise NotImplementedError("Inkling2 SM80 attention requires causal masking")
@@ -275,20 +308,51 @@ def sm80_rel_attention(
     block_h = triton.next_power_of_2(gqa_group_size)
     # tl.dot needs >= 16 rows; BLOCK_QH = BLOCK_Q * BLOCK_H.
     block_q = max(16 // block_h, 1)
-    grid = (triton.cdiv(max_seqlen_q, block_q), num_kv_heads, batch)
+    grid_q = triton.cdiv(max_seqlen_q, block_q)
+    if num_splits is None:
+        # A decode step launches few programs (grid_q * kv_heads * batch can
+        # be 1), leaving most of the GPU dark over a long KV scan; shard the
+        # scan so the launch has ~512 CTAs. Prefill already has enough
+        # q-block programs and stays unsplit.
+        base_ctas = grid_q * num_kv_heads * batch
+        num_splits = max(1, min(64, (512 + base_ctas - 1) // base_ctas))
+    num_splits = max(1, int(num_splits))
+    total_q, num_heads = q.shape[0], q.shape[1]
+    if num_splits > 1:
+        part_out = torch.empty(
+            (num_splits, total_q, num_heads, q.shape[2]),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        part_lse = torch.empty(
+            (num_splits, num_heads, total_q),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        out_arg, lse_arg = part_out, part_lse
+        stride_o_s, stride_o_t, stride_o_h, stride_o_d = part_out.stride()
+        stride_lse_s, stride_lse_h, stride_lse_t = part_lse.stride()
+    else:
+        out_arg, lse_arg = out, lse
+        stride_o_s = 0
+        stride_o_t, stride_o_h, stride_o_d = out.stride()
+        stride_lse_s = 0
+        stride_lse_h, stride_lse_t = lse.stride()
+    grid = (grid_q * num_splits, num_kv_heads, batch)
     _sm80_rel_attention_kernel[grid](
         q,
         key_cache,
         value_cache,
         rel_logits,
-        out,
-        lse,
+        out_arg,
+        lse_arg,
         block_table,
         cache_seqlens,
         cu_seqlens_q,
         gqa_group_size,
         q.shape[2],
         softmax_scale,
+        num_splits,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -303,11 +367,13 @@ def sm80_rel_attention(
         rel_logits.stride(0),
         rel_logits.stride(1),
         rel_logits.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        lse.stride(0),
-        lse.stride(1),
+        stride_o_s,
+        stride_o_t,
+        stride_o_h,
+        stride_o_d,
+        stride_lse_s,
+        stride_lse_h,
+        stride_lse_t,
         block_table.stride(0),
         page_size=key_cache.shape[1],
         rel_extent=rel_extent,
@@ -315,5 +381,27 @@ def sm80_rel_attention(
         BLOCK_Q=block_q,
         BLOCK_K=64,
         num_warps=4,
-        num_stages=1,
+        num_stages=2,
     )
+    if num_splits > 1:
+        # LSE-weighted merge of the per-split normalized outputs. Empty
+        # shards carry -inf LSE and zero weight.
+        lse_max = part_lse.amax(dim=0)
+        safe_max = torch.where(
+            lse_max.isfinite(), lse_max, torch.zeros_like(lse_max)
+        )
+        w = torch.exp(part_lse - safe_max.unsqueeze(0))
+        denom = w.sum(dim=0)
+        weighted = (part_out * w.permute(0, 2, 1).unsqueeze(-1)).sum(dim=0)
+        out.copy_(
+            weighted / torch.clamp(denom, min=1e-30)
+            .transpose(0, 1)
+            .unsqueeze(-1)
+        )
+        lse.copy_(
+            torch.where(
+                denom > 0,
+                safe_max + torch.log(torch.clamp(denom, min=1e-30)),
+                torch.full_like(denom, float("-inf")),
+            )
+        )

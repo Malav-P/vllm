@@ -225,7 +225,9 @@ def _fa4_rel_attention_sm80(
 ) -> None:
     """SM80 path (see ``_use_sm80_triton``): unshear the relative logits and
     run the Triton kernel adapted from the ROCm port, writing the fp32 output
-    and natural-log LSE directly (no split-KV; ``num_splits`` is ignored).
+    and natural-log LSE directly. The launcher shards the KV scan across
+    programs when the launch would otherwise be too small (decode), ignoring
+    the caller's ``num_splits`` heuristic.
     """
     from vllm.models.inkling2.ops.sm80_attention import sm80_rel_attention
 
