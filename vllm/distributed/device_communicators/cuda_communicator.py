@@ -368,6 +368,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
+        # One-shot NVLink IPC kernel for small messages (decode-step
+        # conv-shard gathers); returns None past its size cap, on
+        # unsupported dtypes, or without P2P, falling back to pynccl.
+        output = self.custom_all_gather(input_)
+        if output is not None:
+            input_size = input_.size()
+            return (
+                output.reshape((self.world_size,) + input_size)
+                .movedim(0, dim)
+                .reshape(
+                    input_size[:dim]
+                    + (self.world_size * input_size[dim],)
+                    + input_size[dim + 1 :]
+                )
+            )
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             return super().all_gather(input_, dim)
@@ -413,10 +429,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if should_nccl_symm_mem_ag_rs():
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
-            output = torch.empty(
-                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-            )
-            pynccl_comm.reduce_scatter(output, input_tensor)
+            # One-shot NVLink IPC kernel for small messages (decode-step
+            # conv-shard scatters); returns None past its size cap, on
+            # unsupported dtypes, or without P2P, falling back to pynccl.
+            output = self.custom_reduce_scatter(input_tensor)
+            if output is None:
+                output = torch.empty(
+                    output_shape,
+                    dtype=input_tensor.dtype,
+                    device=input_tensor.device,
+                )
+                pynccl_comm.reduce_scatter(output, input_tensor)
 
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
