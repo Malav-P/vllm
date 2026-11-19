@@ -439,7 +439,29 @@ def merge_split_partials_torch(
     )
 
 
-@triton.jit
+# Every int arg varies with the batch (token count, split count), and Triton
+# would otherwise specialize each on ==1 / %16, recompiling mid-serve as
+# shapes change (a cold JIT stall, or a crash if the compile fails). Keep it
+# to a single compiled variant.
+@triton.jit(
+    do_not_specialize=[
+        "num_splits",
+        "num_heads",
+        "head_dim",
+        "stride_po_s",
+        "stride_po_t",
+        "stride_po_h",
+        "stride_po_d",
+        "stride_pl_s",
+        "stride_pl_h",
+        "stride_pl_t",
+        "stride_o_t",
+        "stride_o_h",
+        "stride_o_d",
+        "stride_l_h",
+        "stride_l_t",
+    ]
+)
 def _merge_split_partials_kernel(
     part_out_ptr,  # [S, T, H, D] fp32
     part_lse_ptr,  # [S, H, T] fp32
@@ -522,7 +544,9 @@ def merge_split_partials(
         *part_lse.stride(),
         *out.stride(),
         *lse.stride(),
-        BLOCK_S=triton.next_power_of_2(num_splits),
+        # Fixed at the launcher's split cap so the split count never
+        # selects a new compiled variant.
+        BLOCK_S=max(64, triton.next_power_of_2(num_splits)),
         BLOCK_D=triton.next_power_of_2(head_dim),
         num_warps=4,
     )

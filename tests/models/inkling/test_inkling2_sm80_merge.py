@@ -169,3 +169,21 @@ def test_sheared_bias_matches_unshear_path(window: int) -> None:
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref_out, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(lse, ref_lse, rtol=1e-5, atol=1e-5)
+
+
+def test_merge_compiles_once_across_batch_shapes() -> None:
+    """Shape changes mid-serve must not trigger new JIT compiles."""
+    from vllm.models.inkling2.ops.sm80_attention import (
+        _merge_split_partials_kernel,
+    )
+
+    for num_splits, total_q in [(2, 1), (7, 5), (64, 16), (33, 3)]:
+        part_out = torch.randn(num_splits, total_q, 8, 128, device="cuda")
+        part_lse = torch.randn(num_splits, 8, total_q, device="cuda")
+        out = torch.empty(total_q, 8, 128, device="cuda")
+        lse = torch.empty(8, total_q, device="cuda")
+        merge_split_partials(part_out, part_lse, out, lse)
+    torch.cuda.synchronize()
+    caches = _merge_split_partials_kernel.device_caches
+    variants = sum(len(c[0]) for c in caches.values())
+    assert variants == 1, f"{variants} compiled variants"
