@@ -131,7 +131,9 @@ def _unshear_rel_logits(
         )
         - 1
     ).clamp(min=0, max=q_lens.shape[0] - 1)
-    i_loc = torch.arange(num_tokens, device=device) - cu_seqlens_q[:-1].to(torch.long)[req]
+    i_loc = (
+        torch.arange(num_tokens, device=device) - cu_seqlens_q[:-1].to(torch.long)[req]
+    )
     pos = past[req] + i_loc
     tile_end = torch.minimum((i_loc // 128 + 1) * 128, q_lens[req])
     n_max = (past[req] + tile_end + 127) // 128
@@ -142,7 +144,9 @@ def _unshear_rel_logits(
     valid = (cols >= 0) & (cols < sheared.shape[-1])
     cols = cols.clamp(0, sheared.shape[-1] - 1)
     rel = sheared[:num_tokens].gather(2, cols[:, None, :].expand(-1, num_heads, -1))
-    rel = torch.where(valid[:, None, :], rel, torch.zeros((), dtype=rel.dtype, device=device))
+    rel = torch.where(
+        valid[:, None, :], rel, torch.zeros((), dtype=rel.dtype, device=device)
+    )
     return torch.nan_to_num(rel, nan=0.0).contiguous()
 
 
@@ -223,8 +227,8 @@ def _fa4_rel_attention_sm80(
     out: torch.Tensor,
     lse: torch.Tensor,
 ) -> None:
-    """SM80 path (see ``_use_sm80_triton``): unshear the relative logits and
-    run the Triton kernel adapted from the ROCm port, writing the fp32 output
+    """SM80 path (see ``_use_sm80_triton``): run the Triton kernel adapted
+    from the ROCm port on the sheared relative logits, writing the fp32 output
     and natural-log LSE directly. The launcher shards the KV scan across
     programs when the launch would otherwise be too small (decode), ignoring
     the caller's ``num_splits`` heuristic.
@@ -239,9 +243,8 @@ def _fa4_rel_attention_sm80(
         # data-dependent, so trace with a shape-only view (values are never
         # read under fake tensors) and skip the launch.
         return
-    rel = _unshear_rel_logits(
-        sheared_bias, q.shape[0], cache_seqlens, cu_seqlens_q, rel_extent
-    )
+    # The kernel reads the sheared table directly (``sheared=True``), so the
+    # ~15-op ``_unshear_rel_logits`` rebuild is skipped on this path.
     sm80_rel_attention(
         q,
         key_cache,
@@ -253,9 +256,10 @@ def _fa4_rel_attention_sm80(
         softmax_scale=softmax_scale,
         window_size=window_size,
         rel_extent=rel_extent,
-        rel_logits=rel,
+        rel_logits=sheared_bias,
         out=out,
         lse=lse,
+        sheared=True,
     )
 
 

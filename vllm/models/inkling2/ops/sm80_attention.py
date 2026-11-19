@@ -39,7 +39,7 @@ def _sm80_rel_attention_kernel(
     q_ptr,  # [total_q, Hq, D]
     k_ptr,  # [blocks, page, Hkv, D]
     v_ptr,  # [blocks, page, Hkv, D]
-    rel_ptr,  # [total_q, Hq, rel_extent]
+    rel_ptr,  # [total_q, Hq, rel_extent], or sheared [total_q + 128, Hq, W]
     out_ptr,  # [total_q, Hq, D] (fp32)
     lse_ptr,  # [Hq, total_q] (fp32, natural log)
     block_table_ptr,  # [batch, max_pages]
@@ -79,6 +79,7 @@ def _sm80_rel_attention_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_QH: tl.constexpr,
+    SHEARED: tl.constexpr = False,
 ):
     # A program owns BLOCK_Q query positions and every query head sharing one
     # KV head; rows are flattened to (BLOCK_Q * BLOCK_H, BLOCK_D) for the QK
@@ -133,6 +134,14 @@ def _sm80_rel_attention_kernel(
     d_valid = off_d < head_dim
     off_h = tl.arange(0, BLOCK_H)
 
+    if SHEARED:
+        # attention_prologue's sheared layout: column c of query row t holds
+        # distance pos(t) - c - offset(t), i.e. key k_pos sits at column
+        # k_pos - offset(t), with offset from the end of t's 128-row tile
+        # (same arithmetic as ``_unshear_rel_logits``, done in-kernel).
+        tile_end = tl.minimum((q_rows // 128 + 1) * 128, q_len)
+        n_max = (prefix_len + tile_end + 127) // 128
+        shear_offset = n_max * 128 - (rel_extent + 256)
     m_i = tl.full((BLOCK_QH,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_QH,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_QH, BLOCK_D), dtype=tl.float32)
@@ -175,15 +184,23 @@ def _sm80_rel_attention_kernel(
                 & score_valid[:, None, :]
                 & (rel_dist < rel_extent)
             )
-            safe_dist = tl.maximum(0, tl.minimum(rel_dist, rel_extent - 1))
+            if SHEARED:
+                col = k_pos[None, None, :] - shear_offset[:, None, None]
+                rel_valid &= (col >= 0) & (col < rel_extent + 256)
+                rel_col = tl.maximum(0, tl.minimum(col, rel_extent + 255))
+            else:
+                rel_col = tl.maximum(0, tl.minimum(rel_dist, rel_extent - 1))
             bias = tl.load(
                 rel_ptr
                 + (q_start + q_rows[:, None, None]) * stride_r_t
                 + (q_head_start + off_h[None, :, None]) * stride_r_h
-                + safe_dist * stride_r_e,
+                + rel_col * stride_r_e,
                 mask=rel_valid,
                 other=0.0,
             )
+            if SHEARED:
+                # Sheared padding is NaN; the unshear mapped it to zero.
+                bias = tl.where(bias == bias, bias, 0.0)
             bias = tl.reshape(bias, (BLOCK_QH, BLOCK_K))
             scores += bias.to(tl.float32) * log2e
         score_valid = tl.reshape(
@@ -276,6 +293,7 @@ def sm80_rel_attention(
     out: torch.Tensor,
     lse: torch.Tensor,
     num_splits: int | None = None,
+    sheared: bool = False,
 ) -> None:
     """Paged varlen relative attention writing fp32 ``out`` and the
     ``(num_heads, total_q)`` natural-log ``lse``.
@@ -292,10 +310,15 @@ def sm80_rel_attention(
         raise NotImplementedError("Inkling2 SM80 attention requires causal masking")
     if q.ndim != 3 or key_cache.ndim != 4 or value_cache.ndim != 4:
         raise ValueError("expected q [T,H,D] and paged K/V [B,P,Hkv,D]")
-    if rel_logits.shape != (q.shape[0], q.shape[1], rel_extent):
+    want = (
+        (q.shape[0] + 128, q.shape[1], rel_extent + 256)
+        if sheared
+        else (q.shape[0], q.shape[1], rel_extent)
+    )
+    if rel_logits.shape != want:
         raise ValueError(
-            f"relative logits have shape {tuple(rel_logits.shape)}, expected "
-            f"{(q.shape[0], q.shape[1], rel_extent)}"
+            f"relative logits have shape {tuple(rel_logits.shape)}, expected {want}"
+            f" (sheared={sheared})"
         )
     num_kv_heads = key_cache.shape[2]
     if q.shape[1] % num_kv_heads:
@@ -382,6 +405,7 @@ def sm80_rel_attention(
         window_left=window_size[0],
         BLOCK_Q=block_q,
         BLOCK_K=64,
+        SHEARED=sheared,
         num_warps=4,
         num_stages=2,
     )
