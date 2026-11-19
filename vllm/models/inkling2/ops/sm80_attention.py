@@ -222,8 +222,10 @@ def _sm80_rel_attention_kernel(
     acc = acc / tl.where(l_i > 0, l_i, 1.0)[:, None]
     acc = tl.reshape(acc, (BLOCK_Q, BLOCK_H, BLOCK_D))
     out_block_ptr = tl.make_block_ptr(
-        base=out_ptr + pid_s * stride_o_s
-        + q_start * stride_o_t + q_head_start * stride_o_h,
+        base=out_ptr
+        + pid_s * stride_o_s
+        + q_start * stride_o_t
+        + q_head_start * stride_o_h,
         shape=(q_len, gqa_group_size, head_dim),
         strides=(stride_o_t, stride_o_h, stride_o_d),
         offsets=(q_block, 0, 0),
@@ -384,24 +386,119 @@ def sm80_rel_attention(
         num_stages=2,
     )
     if num_splits > 1:
-        # LSE-weighted merge of the per-split normalized outputs. Empty
-        # shards carry -inf LSE and zero weight.
-        lse_max = part_lse.amax(dim=0)
-        safe_max = torch.where(
-            lse_max.isfinite(), lse_max, torch.zeros_like(lse_max)
+        merge_split_partials(part_out, part_lse, out, lse)
+
+
+def merge_split_partials_torch(
+    part_out: torch.Tensor,
+    part_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+) -> None:
+    """Reference LSE-weighted merge of per-split normalized outputs.
+
+    ``part_out`` is ``(S, T, H, D)``, ``part_lse`` ``(S, H, T)``; empty
+    shards carry -inf LSE and zero weight.
+    """
+    lse_max = part_lse.amax(dim=0)
+    safe_max = torch.where(lse_max.isfinite(), lse_max, torch.zeros_like(lse_max))
+    w = torch.exp(part_lse - safe_max.unsqueeze(0))
+    denom = w.sum(dim=0)
+    weighted = (part_out * w.permute(0, 2, 1).unsqueeze(-1)).sum(dim=0)
+    out.copy_(weighted / torch.clamp(denom, min=1e-30).transpose(0, 1).unsqueeze(-1))
+    lse.copy_(
+        torch.where(
+            denom > 0,
+            safe_max + torch.log(torch.clamp(denom, min=1e-30)),
+            torch.full_like(denom, float("-inf")),
         )
-        w = torch.exp(part_lse - safe_max.unsqueeze(0))
-        denom = w.sum(dim=0)
-        weighted = (part_out * w.permute(0, 2, 1).unsqueeze(-1)).sum(dim=0)
-        out.copy_(
-            weighted / torch.clamp(denom, min=1e-30)
-            .transpose(0, 1)
-            .unsqueeze(-1)
-        )
-        lse.copy_(
-            torch.where(
-                denom > 0,
-                safe_max + torch.log(torch.clamp(denom, min=1e-30)),
-                torch.full_like(denom, float("-inf")),
-            )
-        )
+    )
+
+
+@triton.jit
+def _merge_split_partials_kernel(
+    part_out_ptr,  # [S, T, H, D] fp32
+    part_lse_ptr,  # [S, H, T] fp32
+    out_ptr,  # [T, H, D] fp32
+    lse_ptr,  # [H, T] fp32
+    num_splits,
+    num_heads,
+    head_dim,
+    stride_po_s,
+    stride_po_t,
+    stride_po_h,
+    stride_po_d,
+    stride_pl_s,
+    stride_pl_h,
+    stride_pl_t,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_l_h,
+    stride_l_t,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    t = pid // num_heads
+    h = pid % num_heads
+    off_s = tl.arange(0, BLOCK_S)
+    s_valid = off_s < num_splits
+    part_lse = tl.load(
+        part_lse_ptr + off_s * stride_pl_s + h * stride_pl_h + t * stride_pl_t,
+        mask=s_valid,
+        other=float("-inf"),
+    )
+    lse_max = tl.max(part_lse, axis=0)
+    safe_max = tl.where(lse_max > float("-inf"), lse_max, 0.0)
+    w = tl.where(s_valid, tl.exp(part_lse - safe_max), 0.0)
+    denom = tl.sum(w, axis=0)
+    off_d = tl.arange(0, BLOCK_D)
+    d_valid = off_d < head_dim
+    part = tl.load(
+        part_out_ptr
+        + off_s[:, None] * stride_po_s
+        + t * stride_po_t
+        + h * stride_po_h
+        + off_d[None, :] * stride_po_d,
+        mask=s_valid[:, None] & d_valid[None, :],
+        other=0.0,
+    )
+    # Zero-weight shards contribute nothing even if their partial is
+    # unwritten memory (rows past a request's q_len are never stored).
+    acc = tl.sum(tl.where(w[:, None] > 0, part * w[:, None], 0.0), axis=0)
+    tl.store(
+        out_ptr + t * stride_o_t + h * stride_o_h + off_d * stride_o_d,
+        acc / tl.maximum(denom, 1e-30),
+        mask=d_valid,
+    )
+    tl.store(
+        lse_ptr + h * stride_l_h + t * stride_l_t,
+        tl.where(denom > 0, safe_max + tl.log(tl.maximum(denom, 1e-30)), -float("inf")),
+    )
+
+
+def merge_split_partials(
+    part_out: torch.Tensor,
+    part_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+) -> None:
+    """One-launch LSE merge; same semantics as ``merge_split_partials_torch``."""
+    num_splits, total_q, num_heads, head_dim = part_out.shape
+    _merge_split_partials_kernel[(total_q * num_heads,)](
+        part_out,
+        part_lse,
+        out,
+        lse,
+        num_splits,
+        num_heads,
+        head_dim,
+        *part_out.stride(),
+        *part_lse.stride(),
+        *out.stride(),
+        *lse.stride(),
+        BLOCK_S=triton.next_power_of_2(num_splits),
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
